@@ -8,6 +8,9 @@
 #include <Library/CacheMaintenanceLib.h>
 #include <Library/ArmLib.h>
 #include <Library/BaseMemoryLib.h>
+#include <Library/BaseLib.h>
+#include <Guid/Acpi.h>
+#include <IndustryStandard/Acpi.h>
 #include <Library/I2cLib.h>
 #include <Library/NonDiscoverableDeviceRegistrationLib.h>
 #include <Protocol/ComponentName2.h>
@@ -19,6 +22,7 @@
 #include <Protocol/Usb2HostController.h>
 #include <Protocol/UsbIo.h>
 #include <Protocol/BlockIo.h>
+#include <Protocol/Cpu.h>
 #include <Protocol/Utc/Tegra210/PinMux.h>
 
 #define BASE_ADDR       0x7000C000UL
@@ -547,6 +551,12 @@ STATIC VOID CaptureR292CarFileSnapshot (BOOLEAN AfterFileRead) {
 
 // R362: tegra21x_xusb_firmware embedded in the ROM as a FREEFORM file with a
 // single RAW section (see NintendoSwitch.fdf), so no SD card is needed.
+// R392: the published ROM does not embed it (NVIDIA's licence allows
+// redistribution only for open source operating systems). The user puts
+// their own copy at the root of a FAT volume (the SD's ESP) and the FAT path
+// below loads it. Any size the header agrees with is taken: the tested L4T
+// image is 124,416 bytes, linux-firmware's nvidia/tegra210/xusb.bin 126,464.
+#define XUSB_FW_SIZE_OK(Size)  ((Size) >= 65536U && (Size) <= 262144U)
 STATIC CONST EFI_GUID mR362XusbFirmwareFileGuid = {
   0x5a0f6a3e, 0x2d4c, 0x4c1b, { 0x9e, 0x51, 0x7b, 0x3f, 0x16, 0x8a, 0x0c, 0x42 }
 };
@@ -571,7 +581,7 @@ STATIC BOOLEAN R362LoadEmbeddedFirmware (VOID) {
   ImageLength = (Size >= 256) ? ReadLe32 ((UINT8 *)Data + 100) : 0;
   Print (L"R362 embedded XUSB firmware: size=%u fwimg_len=%u boot_codetag=%08x boot_codesize=%u\r\n",
          (UINT32)Size, ImageLength, CodeTag, CodeSize);
-  if (Size != 124416 || ImageLength != Size || CodeTag >= ImageLength || CodeSize == 0 ||
+  if (!XUSB_FW_SIZE_OK (Size) || ImageLength != Size || CodeTag >= ImageLength || CodeSize == 0 ||
       CodeTag + CodeSize > ImageLength) {
     Print (L"R362 embedded XUSB firmware header validation: FAIL; trying FAT volumes\r\n");
     gBS->FreePool (Data);
@@ -664,15 +674,15 @@ STATIC BOOLEAN AuditXusbFirmwareFile (VOID) {
     Version = ReadLe32 (&Header[72]);
     ImageLength = ReadLe32 (&Header[100]);
     Print (L"Found \\tegra21x_xusb_firmware on FAT volume %d\r\n", (UINT32)Index);
-    Print (L"File size=%ld expected=124416 %s\r\n", FileSize,
-           FileSize == 124416ULL ? L"MATCH" : L"DIFF");
+    Print (L"File size=%ld (tested: 124416 L4T, 126464 linux-firmware) %s\r\n", FileSize,
+           XUSB_FW_SIZE_OK (FileSize) ? L"IN RANGE" : L"OUT OF RANGE");
     Print (L"Header: fwimg_len=%u boot_codetag=%08x boot_codesize=%u\r\n",
            ImageLength, CodeTag, CodeSize);
     Print (L"Header: created=%u version_id=%08x magic=%c%c%c%c%c%c%c%c\r\n",
            Created, Version,
            (CHAR16)Header[104], (CHAR16)Header[105], (CHAR16)Header[106], (CHAR16)Header[107],
            (CHAR16)Header[108], (CHAR16)Header[109], (CHAR16)Header[110], (CHAR16)Header[111]);
-    if (FileSize == 124416ULL && ImageLength == FileSize &&
+    if (XUSB_FW_SIZE_OK (FileSize) && ImageLength == FileSize &&
         CodeTag < ImageLength && CodeSize != 0 && CodeTag + CodeSize <= ImageLength) {
       Print (L"R77 firmware header validation: PASS\r\n");
     } else {
@@ -1425,7 +1435,7 @@ STATIC BOOLEAN RunR246FirmwareTransfer (volatile UINT32 *Fpci, UINT8 *Firmware,
   UINT32 SavedRange = Fpci[0x41C / 4];
   BOOLEAN Ok = FALSE;
 
-  if (FirmwareSize != 124416U || FirmwareAddress + FirmwareSize > 0x100000000ULL ||
+  if (!XUSB_FW_SIZE_OK (FirmwareSize) || FirmwareAddress + FirmwareSize > 0x100000000ULL ||
       ReadLe32 (&Firmware[100]) != FirmwareSize || CodeTag == 0 || CodeSize == 0 ||
       (UINT64)CodeTag + CodeSize > FirmwareSize || (LoadBaseLo & 0xFFU) != 0) {
     Print (L"R246 STOP: transfer inputs failed validation; no firmware write.\r\n");
@@ -2405,6 +2415,53 @@ STATIC BOOLEAN R362ApplyHostPadctl (VOID) {
 STATIC VOID R363PrintPower (CONST CHAR16 *Tag);
 STATIC VOID R366PrintFan (CONST CHAR16 *Tag, UINT32 Seconds);
 STATIC VOID R373PrintTouch (VOID);
+STATIC VOID R386PrintGpioIrq (VOID);
+
+// R389: the DSDT keeps XHC0 hidden (Name (XSTA, 0x10), AML 08 'XSTA' 0A 10)
+// until XUSB is really running; then set it to 0x0F here and fix the DSDT
+// checksum. Windows froze at the logo when usbxhci met an XUSB that this
+// driver never started (hekate chain, charger set-up stopped early).
+STATIC VOID R389ShowXhciToOs (VOID) {
+  EFI_ACPI_2_0_ROOT_SYSTEM_DESCRIPTION_POINTER *Rsdp = NULL;
+  EFI_ACPI_DESCRIPTION_HEADER *Xsdt, *Table, *Dsdt = NULL;
+  EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *Fadt;
+  CONST UINT8 Pattern[7] = { 0x08, 'X', 'S', 'T', 'A', 0x0A, 0x10 };
+  UINT8 *Aml, Sum = 0;
+  UINTN Entries, I;
+
+  if (EFI_ERROR (EfiGetSystemConfigurationTable (&gEfiAcpi20TableGuid, (VOID **)&Rsdp)) || Rsdp == NULL ||
+      Rsdp->XsdtAddress == 0) {
+    Print (L"R389 XHC0: no ACPI 2.0 RSDP/XSDT; left hidden\r\n");
+    return;
+  }
+  Xsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)Rsdp->XsdtAddress;
+  Entries = (Xsdt->Length - sizeof (*Xsdt)) / sizeof (UINT64);
+  for (I = 0; I < Entries && Dsdt == NULL; ++I) {
+    Table = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)ReadUnaligned64 ((UINT64 *)((UINT8 *)Xsdt + sizeof (*Xsdt) + I * 8));
+    if (Table->Signature == EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE_SIGNATURE) {
+      Fadt = (EFI_ACPI_2_0_FIXED_ACPI_DESCRIPTION_TABLE *)Table;
+      Dsdt = (EFI_ACPI_DESCRIPTION_HEADER *)(UINTN)(Fadt->XDsdt != 0 ? Fadt->XDsdt : Fadt->Dsdt);
+    }
+  }
+  if (Dsdt == NULL) {
+    Print (L"R389 XHC0: no DSDT; left hidden\r\n");
+    return;
+  }
+  Aml = (UINT8 *)Dsdt;
+  for (I = sizeof (*Dsdt); I + sizeof (Pattern) <= Dsdt->Length; ++I) {
+    if (CompareMem (&Aml[I], Pattern, sizeof (Pattern)) == 0) {
+      Aml[I + 6] = 0x0F;
+      Dsdt->Checksum = 0;
+      for (I = 0; I < Dsdt->Length; ++I) Sum = (UINT8)(Sum + Aml[I]);
+      Dsdt->Checksum = (UINT8)(0 - Sum);
+      Print (L"R389 XHC0: XUSB running, shown to the OS (DSDT patched)\r\n");
+      return;
+    }
+  }
+  Print (L"R389 XHC0: XSTA not found in the DSDT; left as built\r\n");
+}
+STATIC VOID R388PrintXusbClocks (CONST CHAR16 *Tag);
+STATIC VOID R388PrintXusbState (VOID);
 
 // R362: periodic read-only report of what the stock USB stack found. Runs a
 // few times after ConnectController so UsbBus can enumerate in between.
@@ -2474,6 +2531,7 @@ STATIC VOID EFIAPI R362UsbStatus (EFI_EVENT Event, VOID *Context) {
   }
 
   if (mR362StatusRound >= 4) {
+    R388PrintXusbState ();
     gBS->SetTimer (Event, TimerCancel, 0);
     gBS->CloseEvent (Event);
     mR362StatusEvent = NULL;
@@ -2620,6 +2678,7 @@ STATIC BOOLEAN R362ProductionAttach (volatile UINT32 *Hcd, UINT32 OpBase,
          Hcd[OpBase + (0x400 + 0x10 * 4) / 4]);
   mR362Attached = (Usb2Hc != NULL);
   if (mR362Attached) {
+    R389ShowXhciToOs ();
     mR300Gate = R300_GATE_DONE;
     mR362StatusRound = 0;
     if (!EFI_ERROR (gBS->CreateEvent (EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
@@ -3026,7 +3085,7 @@ STATIC VOID RunR244FirmwareLoadPlanAudit (UINT32 Stage) {
   LoadAddress = mFirmwareAddress + 256U;
   PlanOk = (mFirmwareAddress != 0 &&
             mFirmwareAddress + mFirmwareSize <= 0x100000000ULL &&
-            mFirmwareSize == 124416U && ImageLength == mFirmwareSize &&
+            XUSB_FW_SIZE_OK (mFirmwareSize) && ImageLength == mFirmwareSize &&
             CodeTag != 0 && CodeSize != 0 &&
             (UINT64)CodeTag + (UINT64)CodeSize <= ImageLength &&
             (LoadAddress & 0xFFU) == 0 && (CodeTag & 0xFFU) == 0 &&
@@ -3400,6 +3459,14 @@ STATIC VOID R366StartFan (VOID) {
     Print (L"R366 PWM clock enabled: clk=%u reset=%u SRC=%08x\r\n",
            (Car[CAR_CLK_OUT_ENB_L / 4] & CLK_L_PWM_BIT) != 0,
            (Car[CAR_RST_DEVICES_L / 4] & CLK_L_PWM_BIT) != 0, Car[CAR_CLK_SOURCE_PWM / 4]);
+  } else if (Car[CAR_CLK_SOURCE_PWM / 4] != ((6U << 29) | 4U)) {
+    // R389: hekate leaves the PWM running from its own clock source. The
+    // backlight then flickered under Windows (switchfan.sys assumes this
+    // rate), so set the coreboot-chain source without resetting the PWM.
+    UINT32 OldSrc = Car[CAR_CLK_SOURCE_PWM / 4];
+    Car[CAR_CLK_SOURCE_PWM / 4] = (6U << 29) | 4U;
+    Print (L"R389 PWM clock source %08x -> %08x (left running by the previous loader)\r\n",
+           OldSrc, Car[CAR_CLK_SOURCE_PWM / 4]);
   }
 
   // Tachometer input: PS7 as GPIO input with pull-up.
@@ -3668,6 +3735,747 @@ STATIC VOID R373PrintTouch (VOID) {
   }
 }
 
+// R379: sensors for switchsensor.sys. L4T DT: BH1730FVC light sensor 0x29 on
+// i2c@7000c400 (I2C2; VID from LDO6, which R373 already turned on), and the
+// LSM6DS3H IMU on spi@7000da00 (SPI4, CS0, mode 3). UEFI only clocks the two
+// controllers, sets their pins and reads the chip IDs; the Windows driver
+// configures the chips.
+#define I2C2_BASE_R379       0x7000C400UL
+#define SPI4_BASE            0x7000DA00UL
+#define GPIO_PC_OFFSET       0x008U      // port C: bank 0, port 2
+#define GPIO_PD_OFFSET       0x00CU      // port D: bank 0, port 3
+#define ALS_ADDR             0x29
+#define PINMUX_GEN2_I2C_SCL  0x0C4U
+#define PINMUX_GEN2_I2C_SDA  0x0C8U
+#define PINMUX_SPI4_MOSI     0x078U
+#define PINMUX_SPI4_MISO     0x07CU
+#define PINMUX_SPI4_SCK      0x080U
+#define PINMUX_SPI4_CS0      0x084U
+#define PINMUX_PULL_DOWN_BITS (1U << 2)
+#define CAR_RST_DEVICES_H    0x008U
+#define CAR_CLK_OUT_ENB_H    0x014U
+#define CAR_CLK_SOURCE_I2C2  0x16CU
+#define CAR_CLK_SOURCE_SBC4  0x1B4U
+#define CAR_RST_DEV_H_SET    0x308U
+#define CAR_RST_DEV_H_CLR    0x30CU
+#define CAR_CLK_ENB_H_SET    0x328U
+#define CLK_H_I2C2_BIT       (1U << 22)
+#define CLK_U_SBC4_BIT       (1U << 4)
+#define SPI_COMMAND1         (0x000U / 4)
+#define SPI_TRANS_STATUS     (0x010U / 4)
+#define SPI_FIFO_STATUS      (0x014U / 4)
+#define SPI_DMA_BLK          (0x024U / 4)
+#define SPI_TX_FIFO          (0x108U / 4)
+#define SPI_RX_FIFO          (0x188U / 4)
+#define SPI_CMD1_IMU         ((1U << 30) | (3U << 28) | (1U << 22) | (1U << 12) | (1U << 11) | 7U)  // master, mode 3, CS0 idle high, RX+TX, 8 bit
+#define SPI_PIO              (1U << 31)
+#define SPI_RDY              (1U << 30)
+#define SPI_FIFO_FLUSH       ((1U << 15) | (1U << 14))
+#define SPI_FIFO_ERRORS      0xF0U
+
+// Turns a peripheral clock on and pulses its reset when it is off or in reset.
+STATIC BOOLEAN R379ClockOn (UINT32 EnbReg, UINT32 RstReg, UINT32 EnbSet, UINT32 RstSet, UINT32 RstClr,
+                            UINT32 Bit, UINT32 SourceReg, UINT32 Source) {
+  volatile UINT32 *Car = (volatile UINT32 *)CAR_BASE;
+  if ((Car[EnbReg / 4] & Bit) != 0 && (Car[RstReg / 4] & Bit) == 0) return FALSE;
+  Car[RstSet / 4] = Bit;
+  Car[SourceReg / 4] = Source;
+  Car[EnbSet / 4] = Bit;
+  gBS->Stall (10);
+  Car[RstClr / 4] = Bit;
+  gBS->Stall (10);
+  return TRUE;
+}
+
+// One full-duplex SPI4 block of Len (<= 16) bytes with the hardware CS0.
+STATIC BOOLEAN R379SpiXfer (CONST UINT8 *Tx, UINT8 *Rx, UINTN Len) {
+  volatile UINT32 *S = (volatile UINT32 *)SPI4_BASE;
+  UINTN I;
+  S[SPI_FIFO_STATUS] = SPI_FIFO_FLUSH | SPI_FIFO_ERRORS;
+  for (I = 0; I < 1000 && (S[SPI_FIFO_STATUS] & SPI_FIFO_FLUSH) != 0; ++I) gBS->Stall (1);
+  S[SPI_TRANS_STATUS] = SPI_RDY;
+  S[SPI_COMMAND1] = SPI_CMD1_IMU;
+  S[SPI_DMA_BLK] = (UINT32)(Len - 1);
+  for (I = 0; I < Len; ++I) S[SPI_TX_FIFO] = Tx[I];
+  S[SPI_COMMAND1] = SPI_CMD1_IMU | SPI_PIO;
+  for (I = 0; I < 1000 && (S[SPI_TRANS_STATUS] & SPI_RDY) == 0; ++I) gBS->Stall (1);
+  if ((S[SPI_TRANS_STATUS] & SPI_RDY) == 0) return FALSE;
+  for (I = 0; I < Len; ++I) Rx[I] = (UINT8)S[SPI_RX_FIFO];
+  S[SPI_TRANS_STATUS] = SPI_RDY;
+  return TRUE;
+}
+
+STATIC VOID R379SensorsPowerOn (VOID) {
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  volatile UINT32 *B = (volatile UINT32 *)I2C2_BASE_R379;
+  CONST UINT8 PartCmd = 0x80U | 0x12U;                        // BH1730 command: register 0x12 PART_ID
+  CONST UINT8 WhoAmI[2] = { 0x80U | 0x0FU, 0x00 };            // IMU read of WHO_AM_I
+  UINT8 Part = 0, Id[2] = { 0, 0 };
+  BOOLEAN Pulsed, Ok;
+  UINT32 St = 0;
+  UINTN Retry;
+
+  // Light sensor: GEN2_I2C pins, I2C2 clock (CLK_M, like I2C3), packet mode.
+  Pin[PINMUX_GEN2_I2C_SCL / 4] = PINMUX_INPUT_EN_BIT;
+  Pin[PINMUX_GEN2_I2C_SDA / 4] = PINMUX_INPUT_EN_BIT;
+  R366GpioSet (GPIO_PJ_OFFSET, GPIO_CNF, 2, FALSE);           // PJ2/PJ3 to the controller
+  R366GpioSet (GPIO_PJ_OFFSET, GPIO_CNF, 3, FALSE);
+  Pulsed = R379ClockOn (CAR_CLK_OUT_ENB_H, CAR_RST_DEVICES_H, CAR_CLK_ENB_H_SET, CAR_RST_DEV_H_SET,
+                        CAR_RST_DEV_H_CLR, CLK_H_I2C2_BIT, CAR_CLK_SOURCE_I2C2, 6U << 29);
+  i2c_init (I2C_2);
+  B[CNFG] |= 0x400U;
+  B[CONFIG_LOAD] = 0x25;
+  for (Retry = 0; Retry < 10000 && (B[CONFIG_LOAD] & 1U) != 0; ++Retry) gBS->Stall (10);
+  Ok = R373I2cXfer (B, ALS_ADDR, &PartCmd, 1, &Part, 1, &St);
+  Print (L"R379 light sensor: I2C2 clock %s, BH1730 PART_ID %s %02x I2C=%08x (expect 7x)\r\n",
+         Pulsed ? L"started" : L"already on", Ok ? L"read" : L"FAIL", Part, St);
+
+  // IMU: SPI4 pins as in the L4T pinmux, clock PLLP / 100 = 4.08 MHz.
+  Pin[PINMUX_SPI4_MOSI / 4] = PINMUX_PULL_DOWN_BITS;
+  Pin[PINMUX_SPI4_MISO / 4] = PINMUX_PULL_UP_BITS | PINMUX_TRISTATE_BIT | PINMUX_INPUT_EN_BIT;
+  Pin[PINMUX_SPI4_SCK / 4] = PINMUX_PULL_DOWN_BITS;
+  Pin[PINMUX_SPI4_CS0 / 4] = PINMUX_PULL_UP_BITS;
+  R366GpioSet (GPIO_PC_OFFSET, GPIO_CNF, 5, FALSE);           // PC5-PC7, PD0 to the controller
+  R366GpioSet (GPIO_PC_OFFSET, GPIO_CNF, 6, FALSE);
+  R366GpioSet (GPIO_PC_OFFSET, GPIO_CNF, 7, FALSE);
+  R366GpioSet (GPIO_PD_OFFSET, GPIO_CNF, 0, FALSE);
+  Pulsed = R379ClockOn (CAR_CLK_OUT_ENB_U, CAR_RST_DEVICES_U, CAR_CLK_ENB_U_SET, CAR_RST_DEV_U_SET,
+                        CAR_RST_DEV_U_CLR, CLK_U_SBC4_BIT, CAR_CLK_SOURCE_SBC4, 198U);
+  ((volatile UINT32 *)SPI4_BASE)[SPI_COMMAND1] = SPI_CMD1_IMU;
+  gBS->Stall (10);
+  Ok = R379SpiXfer (WhoAmI, Id, 2);
+  Print (L"R379 IMU: SPI4 clock %s, WHO_AM_I %s %02x (69 = LSM6DS3H, 6C = LSM6DSO)\r\n",
+         Pulsed ? L"started" : L"already on", Ok ? L"read" : L"FAIL", Id[1]);
+}
+
+// R390: Bluetooth for switchbt.sys. L4T DT: BCM4356A3 (brcm,bcm43438-bt) on
+// serial@70006300 (UART-D, GIC SPI 90); shutdown-gpios PH4 (BT_RST, active
+// high = powered), device-wakeup-gpios PH3 (AP_WAKE_BT, active low = awake);
+// BT_WAKE_AP is PH5. UEFI sets the pins, clocks UART-D from PLLP, powers the
+// chip and checks it answers HCI_Reset and Read_Local_Version at 115200 8N1
+// (the Broadcom ROM default). The chip stays powered for the Windows driver.
+#define UARTD_BASE           0x70006300UL
+#define GPIO_PH_OFFSET       0x10CU      // port H: bank 1, port 3
+#define GPIO_PI_OFFSET       0x200U      // port I: bank 2, port 0
+#define PINMUX_UART4_TX      0x114U
+#define PINMUX_UART4_RX      0x118U
+#define PINMUX_UART4_RTS     0x11CU
+#define PINMUX_UART4_CTS     0x120U
+#define PINMUX_AP_WAKE_BT    0x1C0U
+#define PINMUX_BT_RST        0x1C4U
+#define PINMUX_BT_WAKE_AP    0x1C8U
+#define CAR_CLK_SOURCE_UARTD 0x1C0U
+#define CLK_U_UARTD_BIT      (1U << 1)
+#define UART_THR             (0x00U / 4)
+#define UART_IER             (0x04U / 4)
+#define UART_FCR             (0x08U / 4)
+#define UART_LCR             (0x0CU / 4)
+#define UART_MCR             (0x10U / 4)
+#define UART_LSR             (0x14U / 4)
+#define UART_DLL             (0x00U / 4)
+#define UART_DLM             (0x04U / 4)
+#define UART_LSR_DR          (1U << 0)
+#define UART_LSR_THRE        (1U << 5)
+#define UART_DIV_115200      221U        // 408 MHz / 16 / 221 = 115384 baud
+// R392: UART-D from PLLP 408 MHz with the UART's own divisor, written every
+// boot. R391 set bit 24 (48 MHz), which makes the CAR clock the 16x baud
+// clock and bypasses DLL/DLM: the UART ran at 3 Mbaud and the 115200 check
+// got no answer. switchbt sets the 3 Mbaud clock itself and leaves the CAR
+// register as it was after a session, so a restart must reset it here.
+#define UARTD_CLK_PLLP       0U
+// R391: the BCM4356 low-power clock is MAX77620 GPIO4 in its 32k-out1 mode
+// (L4T DT pin_gpio4 function "32k-out1"; coreboot writes AME_GPIO 0x1C).
+// Check it and turn it on if a loader left GPIO4 a plain GPIO.
+#define MAX77620_CNFG1_32K   0x03
+#define MAX77620_AME_GPIO    0x40
+#define MAX77620_AME_GPIO4   (1U << 4)
+
+STATIC VOID R390UartSend (CONST UINT8 *Buf, UINTN Len) {
+  volatile UINT32 *U = (volatile UINT32 *)UARTD_BASE;
+  UINTN I, T;
+  for (I = 0; I < Len; ++I) {
+    for (T = 0; T < 10000 && (U[UART_LSR] & UART_LSR_THRE) == 0; ++T) gBS->Stall (1);
+    U[UART_THR] = Buf[I];
+  }
+}
+
+// Reads one HCI event (04 code len params) within TimeoutMs; returns its length.
+// Each received byte counts as 90 us (one byte time at 115200), so a line
+// that never stops sending still times out.
+STATIC UINTN R390UartEvent (UINT8 *Buf, UINTN Max, UINTN TimeoutMs) {
+  volatile UINT32 *U = (volatile UINT32 *)UARTD_BASE;
+  UINTN Got = 0, Need = 3, T;
+  for (T = 0; T < TimeoutMs * 100 && Got < Need; ) {
+    if ((U[UART_LSR] & UART_LSR_DR) == 0) { gBS->Stall (10); ++T; continue; }
+    UINT8 B = (UINT8)U[UART_THR];
+    T += 9;
+    if (Got == 0 && B != 0x04U) continue;              // skip anything before an event
+    if (Got < Max) Buf[Got] = B;
+    if (++Got == 3) Need = 3U + B;
+  }
+  return Got >= Need ? Got : 0;
+}
+
+// R393: audio, step 1 (can we talk to the codec?). L4T DT: Realtek ALC5639
+// (realtek,rt5639) on I2C1 at 0x1C, ldo1-en-gpios PZ4 (active high), IRQ
+// PBB4; I2S1 to the codec (codec is the bit/frame clock master), MCLK from
+// AUD_MCLK (PBB0). Its jack-detect-gpios names PV6, which is the touch
+// panel's reset here, so it is not touched (the codec's own JD1 is used).
+// This step only powers the codec (PZ4) and reads its vendor ID; the APE
+// partition and the audio clocks are printed, not changed.
+#define GPIO_PZ_OFFSET       0x604U      // port Z: bank 6, port 1
+#define PINMUX_GPIO_PZ4      0x28CU      // pad 163
+#define RT5639_ADDR          0x1C
+#define RT5640_RESET         0x00
+#define RT5640_VENDOR_ID1    0xFE        // 0x10EC (Realtek)
+#define RT5640_VENDOR_ID2    0xFF
+#define PMC_PWRGATE_STATUS   0x38U
+#define PMC_PG_APE_BIT       27U         // TEGRA_POWERGATE_AUD
+#define CAR_CLK_OUT_ENB_V    0x360U
+#define CAR_PLLA_BASE        0x0B0U
+// R400: the AHUB I2S at 0x702D1000 (Linux "I2S1", DAP1, the codec's) is
+// clocked by the CAR clock named i2s0 (Linux DT: TEGRA210_CLK_I2S0 = 30,
+// source register 0x1D8). R395-R399 started CAR i2s1 (bit 11, 0x100), which
+// feeds the I2S at 0x702D1100; I2S1 stayed without a clock (R399: its RX soft
+// reset never finished, it took nothing from ADMAIF1).
+#define CAR_CLK_SOURCE_I2S1  0x1D8U
+// R401: R400 played the tone (loud, through the speakers). The one-second
+// tone at every boot is now off; set this to 1 to hear it again (bring-up
+// check of codec, I2S1, XBAR, ADMAIF and ADMA). The codec probe still runs.
+#ifndef SWITCH_AUDIO_TEST_TONE
+#define SWITCH_AUDIO_TEST_TONE 0
+#endif
+// R402: the audio path is always set up for Windows (switchaudio.sys, ACPI
+// AUD0): clocks, DAP1, codec, XBAR, ADMAIF1 and I2S1 stay running, only the
+// ADMA channel is left to the driver. Speaker volume 0x1414: -18 dB (the
+// R400 tone at 0x0808 = 0 dB was loud); Windows scales below that.
+#define R402_SPK_VOL         0x1414U
+// R403: headphones. DAC1 -> OUT MIX -> HPOVOL -> HPO MIX -> HP amp (rt5640
+// hp_amp_power_on and pmu_depop), HP volume 0x1818 (-24 dB). The jack
+// switch is PV6 (TOUCH_RST pad, Linux realtek,jack-detect-gpios, active
+// low): the pad becomes a GPIO input, and whichever output the jack picks
+// at boot is unmuted. switchaudio.sys follows the jack after that.
+#define R403_HP_VOL          0x1818U
+#define R403_MUTE            0x8080U       // L and R mute bits of SPK_VOL / HP_VOL
+#define GPIO_PV_OFFSET       0x504U        // port V: bank 5, port 1
+#define PINMUX_TOUCH_RST_PV6 0x214U
+#define RT5640_HP_VOL        0x02
+#define RT5640_HPO_MIXER     0x45
+#define RT5640_OUT_L3_MIXER  0x4F
+#define RT5640_OUT_R3_MIXER  0x52
+#define RT5640_DEPOP_M1      0x8E
+#define RT5640_DEPOP_M2      0x8F
+#define RT5640_DEPOP_M3      0x90
+#define RT5640_CHARGE_PUMP   0x91
+#define CAR_CLK_SOURCE_EXT1  0x3ECU
+#define CAR_CLK_SOURCE_APE   0x6C0U
+
+STATIC BOOLEAN mR395CodecAnswers;
+
+STATIC BOOLEAN R393CodecRead16 (UINT8 Reg, UINT16 *Value) {
+  UINT8 Buf[2] = { 0, 0 };
+  if (i2c_recv_buf_small (Buf, 2, I2C_1, RT5639_ADDR, Reg) == 0) {
+    return FALSE;
+  }
+  *Value = (UINT16)((Buf[0] << 8) | Buf[1]);     // rt5640 registers are 16-bit, big endian
+  return TRUE;
+}
+
+STATIC VOID R393AudioProbe (VOID) {
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  volatile UINT32 *Car = (volatile UINT32 *)CAR_BASE;
+  volatile UINT32 *Pmc = (volatile UINT32 *)PMC_BASE;
+  UINT16 Id1 = 0, Id2 = 0, Reset = 0;
+  BOOLEAN Ok1, Ok2, Ok3;
+
+  // Codec LDO1 enable: PZ4 as a GPIO output, high (pad as in the L4T pinmux, pull down, driven).
+  Pin[PINMUX_GPIO_PZ4 / 4] = PINMUX_PULL_DOWN_BITS;
+  R366GpioSet (GPIO_PZ_OFFSET, GPIO_OUT, 4, TRUE);
+  R366GpioSet (GPIO_PZ_OFFSET, GPIO_OE, 4, TRUE);
+  R366GpioSet (GPIO_PZ_OFFSET, GPIO_CNF, 4, TRUE);
+  // R394: Linux rt5640 waits 400 ms after LDO1_EN before the first access (R393 waited 20 ms: no answer).
+  gBS->Stall (400000);
+  Print (L"R394 audio LDO1_EN PZ4: cnf=%u oe=%u out=%u in=%u pinmux=%08x\r\n",
+         R366GpioBit (GPIO_PZ_OFFSET, GPIO_CNF, 4), R366GpioBit (GPIO_PZ_OFFSET, GPIO_OE, 4),
+         R366GpioBit (GPIO_PZ_OFFSET, GPIO_OUT, 4), R366GpioBit (GPIO_PZ_OFFSET, GPIO_IN, 4),
+         Pin[PINMUX_GPIO_PZ4 / 4]);
+
+  {
+    UINTN Try;
+    Ok1 = FALSE;
+    for (Try = 0; Try < 6 && !Ok1; ++Try) {
+      if (Try != 0) gBS->Stall (100000);
+      Ok1 = R393CodecRead16 (RT5640_VENDOR_ID1, &Id1);
+    }
+    Ok2 = R393CodecRead16 (RT5640_VENDOR_ID2, &Id2);
+    Ok3 = R393CodecRead16 (RT5640_RESET, &Reset);
+    Print (L"R394 audio codec: I2C1 0x1C %s after %u tries VENDOR_ID1=%04x (10ec = Realtek) ID2=%04x reg00=%04x\r\n",
+           Ok1 ? L"answers" : L"NO ANSWER", (UINT32)Try, Id1, Id2, Reset);
+    mR395CodecAnswers = Ok1 && Id2 == 0x6231U;
+  }
+  (VOID)Ok3;
+  Print (L"R393 audio state (read only): APE partition %s  CLK_L=%08x CLK_V=%08x CLK_Y=%08x PLLA=%08x\r\n",
+         ((Pmc[PMC_PWRGATE_STATUS / 4] >> PMC_PG_APE_BIT) & 1U) ? L"on" : L"off",
+         Car[CAR_CLK_OUT_ENB_L / 4], Car[CAR_CLK_OUT_ENB_V / 4], Car[CAR_CLK_OUT_ENB_Y / 4], Car[CAR_PLLA_BASE / 4]);
+  Print (L"R393 audio clocks: I2S1 src=%08x EXTERN1 src=%08x APE src=%08x (i2s1 L11=%u apb2ape V11=%u extern1 V24=%u ape Y6=%u)\r\n",
+         Car[CAR_CLK_SOURCE_I2S1 / 4], Car[CAR_CLK_SOURCE_EXT1 / 4], Car[CAR_CLK_SOURCE_APE / 4],
+         (Car[CAR_CLK_OUT_ENB_L / 4] >> 11) & 1U, (Car[CAR_CLK_OUT_ENB_V / 4] >> 11) & 1U,
+         (Car[CAR_CLK_OUT_ENB_V / 4] >> 24) & 1U, (Car[CAR_CLK_OUT_ENB_Y / 4] >> 6) & 1U);
+}
+
+// R395: audio, step 2: a 1 kHz tone on the speaker for one second at boot.
+// Tegra is the I2S master (the L4T DT makes the codec master, but then MCLK
+// needs PLLA and the AUD_MCLK path): I2S1 from clk_m with the CAR divider
+// gives BCLK = 32 x 48 kHz = 1.536 MHz exactly, and the codec makes its
+// 24.576 MHz sysclk from BCLK1 with its own PLL. The data path is
+// ADMAIF1 TX (written by the CPU, no ADMA yet) -> XBAR -> I2S1 RX CIF ->
+// DAP1 -> codec AIF1 -> DAC L1/R1 -> SPK MIX -> SPKVOL -> SPO L/R (class D).
+// Register values follow Linux tegra210_i2s/admaif/ahub and rt5640.
+#define APE_ADMAIF_BASE      0x702D0000UL
+#define APE_XBAR_BASE        0x702D0800UL
+#define APE_I2S1_BASE        0x702D1000UL
+#define ADMAIF_GLOBAL_ENABLE 0x700U
+#define ADMAIF_TX1_ENABLE    0x300U
+#define ADMAIF_TX1_STATUS    0x30CU
+#define ADMAIF_TX1_ACIF_CTRL 0x320U
+#define ADMAIF_TX1_FIFO_CTRL 0x328U
+#define ADMAIF_TX1_FIFO_WRITE 0x32CU
+#define ADMAIF_TX1_INT_MASK  0x314U
+// R397: Linux writes these register defaults at probe (regcache); the
+// hardware's own reset values differ, e.g. ADMAIF TX1 FIFO_CTRL (FIFO start
+// and size). In R396 the samples written to ADMAIF1 never left it
+// (TX status the same before and after the tone).
+#define ADMAIF_TX1_FIFO_CTRL_DEFAULT 0x02000300U
+// R398: R397's CPU writes to ADMAIF TX1 FIFO_WRITE never moved (status the
+// same before, during and after). Feed ADMAIF1 the way Linux does: ADMA
+// channel 0, memory to AHUB, request = ADMAIF TX1 (DT dmas "tx1" = 1),
+// continuous mode over one 48-frame buffer (one 1 kHz period), and the
+// ADMAIF in 16-bit pack mode (two samples per 32-bit word, as in memory).
+#define APE_ADMA_BASE        0x702E2000UL
+#define ADMA_GLOBAL_CMD      0xC00U
+#define ADMA_CH_CMD          0x00U
+#define ADMA_CH_STATUS       0x0CU
+#define ADMA_CH_CTRL         0x24U
+#define ADMA_CH_CONFIG       0x28U
+#define ADMA_CH_FIFO_CTRL    0x2CU
+#define ADMA_CH_LOWER_SRC    0x34U
+#define ADMA_CH_LOWER_TRG    0x3CU
+#define ADMA_CH_TC           0x44U
+#define ADMA_CH_XFER_STATUS  0x54U
+#define ADMA_CTRL_TX1        ((1U << 28) | (4U << 12) | (2U << 8) | (1U << 1))   // req ADMAIF1, MEM2AHUB, continuous, flow control
+#define ADMA_CONFIG_1BUF     ((5U << 20) | 1U)                                    // burst 16 words, WRR weight 1
+#define ADMA_FIFO_TX3        (3U << 8)
+#define ADMAIF_PACK16        (1U << 30)
+// R399: R398's ADMA ran and ADMAIF1 filled up, but I2S1 took nothing (its
+// status never changed). Linux resets the I2S RX path right before it is
+// enabled (tegra210_i2s_init -> tegra210_i2s_sw_reset: keep CIF/stream/CTRL,
+// RX_SOFT_RESET, wait, write them back); do the same. More status is shown.
+#define I2S_RX_SOFT_RESET    0x04U
+#define I2S_RX_INT_STATUS    0x10U
+#define I2S_STATUS           0x8CU
+#define I2S_INT_STATUS       0x90U
+#define ADMAIF_TX1_INT_STATUS 0x310U
+#define I2S_RX_INT_MASK      0x14U
+#define I2S_TX_INT_MASK      0x54U
+#define I2S_TX_CIF_CTRL      0x60U
+#define I2S_CG               0x88U
+#define I2S_CYA              0xB0U
+#define XBAR_I2S1_RX_MUX     0x040U      // MUX_REG(0x10); parts at +0x200, +0x400
+#define I2S_RX_ENABLE        0x00U
+#define I2S_RX_STATUS        0x0CU
+#define I2S_RX_CIF_CTRL      0x20U
+#define I2S_RX_CTRL          0x24U
+#define I2S_RX_CIF_FIFO_STATUS 0x34U
+#define I2S_ENABLE           0x80U
+#define I2S_CTRL             0xA0U
+#define I2S_TIMING           0xA4U
+#define ACIF_16BIT_STEREO    ((1U << 20) | (1U << 16) | (3U << 12) | (3U << 8))
+#define CAR_SPARE_REG0       0x55CU
+#define CLK_L_I2S1_BIT       (1U << 30)
+// R396: R395 hung at the first APE register: the AHUB/XBAR/I2S/ADMAIF need the
+// d_audio clock (Linux: one of the APE partition's clocks), which was off
+// (CLK_OUT_ENB_V bit 10 = 0). d_audio from clk_m (mux value 0xC000 at bit 16).
+#define CAR_RST_DEVICES_V    0x358U
+#define CAR_RST_DEV_V_SET    0x430U
+#define CAR_RST_DEV_V_CLR    0x434U
+#define CAR_CLK_ENB_V_SET    0x440U
+#define CAR_RST_DEVICES_Y    0x2A4U
+#define CAR_RST_DEV_Y_CLR    0x2ACU
+#define CAR_CLK_SOURCE_D_AUDIO 0x3D0U
+#define CLK_V_D_AUDIO_BIT    (1U << 10)
+#define CLK_Y_APE_BIT        (1U << 6)
+#define PMC_CLAMP_STATUS     0x2CU
+#define GPIO_PB_OFFSET       0x004U      // port B: bank 0, port 1
+#define PINMUX_DAP1_FS       0x124U
+#define PINMUX_DAP1_DIN      0x128U
+#define PINMUX_DAP1_DOUT     0x12CU
+#define PINMUX_DAP1_SCLK     0x130U
+#define RT5640_SPK_VOL       0x01
+#define RT5640_STO_DAC_MIXER 0x2A
+#define RT5640_SPK_L_MIXER   0x46
+#define RT5640_SPK_R_MIXER   0x47
+#define RT5640_SPO_L_MIXER   0x48
+#define RT5640_SPO_R_MIXER   0x49
+#define RT5640_PWR_DIG1      0x61
+#define RT5640_PWR_ANLG1     0x63
+#define RT5640_PWR_ANLG2     0x64
+#define RT5640_PWR_MIXER     0x65
+#define RT5640_PWR_VOL       0x66
+#define RT5640_PRIV_INDEX    0x6A
+#define RT5640_PRIV_DATA     0x6C
+#define RT5640_I2S1_SDP      0x70
+#define RT5640_GLB_CLK       0x80
+#define RT5640_PLL_CTRL1     0x81
+#define RT5640_PLL_CTRL2     0x82
+#define RT5640_MICBIAS       0x93
+#define RT5640_DUMMY1        0xFA
+
+STATIC BOOLEAN R395CodecWrite (UINT8 Reg, UINT16 Value) {
+  UINT8 Buf[2] = { (UINT8)(Value >> 8), (UINT8)Value };
+  return i2c_send_buf_small (I2C_1, RT5639_ADDR, Reg, Buf, 2) != 0;
+}
+
+STATIC BOOLEAN R395CodecUpdate (UINT8 Reg, UINT16 Clear, UINT16 Set) {
+  UINT16 Value = 0;
+  if (!R393CodecRead16 (Reg, &Value)) return FALSE;
+  return R395CodecWrite (Reg, (UINT16)((Value & ~Clear) | Set));
+}
+
+// The codec's speaker path for AIF1 playback, slave with sysclk = PLL1 from BCLK1.
+STATIC BOOLEAN R395CodecSetup (VOID) {
+  STATIC CONST UINT16 Private[][2] = {      // rt5640 init_list
+    { 0x3D, 0x3600 }, { 0x12, 0x0AA8 }, { 0x14, 0x0AAA }, { 0x21, 0xE0E0 }, { 0x23, 0x1804 },
+  };
+  BOOLEAN Ok = TRUE;
+  UINTN Index;
+
+  Ok &= R395CodecWrite (RT5640_RESET, 0);
+  gBS->Stall (10000);
+  for (Index = 0; Index < ARRAY_SIZE (Private); ++Index) {
+    Ok &= R395CodecWrite (RT5640_PRIV_INDEX, Private[Index][0]);
+    Ok &= R395CodecWrite (RT5640_PRIV_DATA, Private[Index][1]);
+  }
+  // Bias (rt5640_set_bias_level STANDBY): VREF1, MB, BG, VREF2; then fast VREF.
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, 0, (1U << 15) | (1U << 13) | (1U << 11) | (1U << 4));
+  gBS->Stall (15000);
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, 0, (1U << 14) | (1U << 3));
+  Ok &= R395CodecUpdate (RT5640_DUMMY1, 0, 0x0001);
+  Ok &= R395CodecUpdate (RT5640_MICBIAS, 0, 0x0030);
+  // Clocks: PLL1 from BCLK1, N = 62, K = 2, M bypassed: 1.536 MHz x 64 / 4 = 24.576 MHz.
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG2, 0, 1U << 9);
+  Ok &= R395CodecWrite (RT5640_PLL_CTRL1, (UINT16)((62U << 7) | 2U));
+  Ok &= R395CodecWrite (RT5640_PLL_CTRL2, 1U << 11);
+  Ok &= R395CodecWrite (RT5640_GLB_CLK, (1U << 14) | (1U << 12));
+  // AIF1: slave, I2S, 16 bit (reset default 0x8000); ADDA_CLK1 keeps pre-div /2 and BCLK 32 fs (0x1114).
+  Ok &= R395CodecWrite (RT5640_I2S1_SDP, 0x8000);
+  // Power: I2S1, DAC L1/R1, class D amp.
+  Ok &= R395CodecUpdate (RT5640_PWR_DIG1, 0, (1U << 15) | (1U << 12) | (1U << 11) | 1U);
+  // Mixers: DAC L1/R1 into the stereo DAC mixer, DAC into SPK MIX, SPKVOL into SPO L/R.
+  Ok &= R395CodecUpdate (RT5640_STO_DAC_MIXER, (1U << 14) | (1U << 6), 0);
+  Ok &= R395CodecUpdate (RT5640_SPK_L_MIXER, 1U << 3, 0);
+  Ok &= R395CodecUpdate (RT5640_SPK_R_MIXER, 1U << 3, 0);
+  Ok &= R395CodecUpdate (RT5640_SPO_L_MIXER, 1U << 12, 0);
+  Ok &= R395CodecUpdate (RT5640_SPO_R_MIXER, 1U << 12, 0);
+  Ok &= R395CodecUpdate (RT5640_PWR_MIXER, 0, (1U << 13) | (1U << 12));
+  Ok &= R395CodecUpdate (RT5640_PWR_VOL, 0, (1U << 15) | (1U << 14));
+  // Speaker volume 0 dB (register 8 of 0..39, +12 dB down to -46.5 dB in 1.5 dB steps), unmuted.
+  Ok &= R395CodecWrite (RT5640_SPK_VOL, 0x0808);
+  return Ok;
+}
+
+// rt5640 private registers go through PRIV_INDEX / PRIV_DATA.
+STATIC BOOLEAN R403PrivUpdate (UINT8 Index, UINT16 Clear, UINT16 Set) {
+  UINT16 Value = 0;
+  if (!R395CodecWrite (RT5640_PRIV_INDEX, Index)) return FALSE;
+  if (!R393CodecRead16 (RT5640_PRIV_DATA, &Value)) return FALSE;
+  return R395CodecWrite (RT5640_PRIV_DATA, (UINT16)((Value & ~Clear) | Set));
+}
+
+STATIC BOOLEAN R403PrivWrite (UINT8 Index, UINT16 Value) {
+  return R395CodecWrite (RT5640_PRIV_INDEX, Index) && R395CodecWrite (RT5640_PRIV_DATA, Value);
+}
+
+// R403: headphone path (muted), then the jack picks the output.
+STATIC VOID R403Headphones (VOID) {
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  BOOLEAN Ok = TRUE;
+  BOOLEAN Plugged;
+
+  Ok &= R395CodecWrite (RT5640_HP_VOL, (UINT16)(R403_HP_VOL | R403_MUTE));
+  // DAC L1/R1 into OUT MIX L/R, HPOVOL into HPO MIX (DAC1 and DAC2 direct stay muted).
+  Ok &= R395CodecUpdate (RT5640_OUT_L3_MIXER, 1U << 0, 0);
+  Ok &= R395CodecUpdate (RT5640_OUT_R3_MIXER, 1U << 0, 0);
+  Ok &= R395CodecUpdate (RT5640_HPO_MIXER, 1U << 13, (1U << 15) | (1U << 14));
+  Ok &= R395CodecUpdate (RT5640_PWR_MIXER, 0, (1U << 15) | (1U << 14));      // OUT MIX L/R
+  Ok &= R395CodecUpdate (RT5640_PWR_VOL, 0, (1U << 11) | (1U << 10));        // HPOVOL L/R
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, 0, (1U << 7) | (1U << 6));        // HP L/R amp
+  // hp_amp_power_on: depop parameters, then the HP amp with FV1/FV2 off for 10 ms.
+  Ok &= R403PrivUpdate (0x24, 0x0700, 0x0200);
+  Ok &= R395CodecUpdate (RT5640_DEPOP_M2, 1U << 13, 1U << 13);
+  Ok &= R395CodecUpdate (RT5640_DEPOP_M1, (1U << 3) | (1U << 2) | 1U, (1U << 3) | 1U);
+  Ok &= R403PrivWrite (0x77, 0x9F00);
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, (1U << 14) | (1U << 3), 0);
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, 0, 1U << 5);
+  gBS->Stall (15000);
+  Ok &= R395CodecUpdate (RT5640_PWR_ANLG1, 0, (1U << 14) | (1U << 3));
+  // pmu_depop: automatic depop, charge pump at HV, pump clocks 192/12/192 kHz.
+  Ok &= R395CodecUpdate (RT5640_DEPOP_M2, (1U << 13) | (1U << 6), 1U << 6);
+  Ok &= R395CodecUpdate (RT5640_CHARGE_PUMP, 3U << 8, 2U << 8);
+  Ok &= R395CodecUpdate (RT5640_DEPOP_M3, 0x0777, (7U << 8) | (3U << 4) | 7U);
+  Ok &= R403PrivWrite (0x37, 0x1C00);
+  Ok &= R395CodecUpdate (RT5640_DEPOP_M1, (1U << 3) | (1U << 2), 1U << 2);
+  Ok &= R403PrivUpdate (0x24, 0x0700, 0x0400);
+
+  // PV6: GPIO input (pad input enabled, output driver off, no pull).
+  Pin[PINMUX_TOUCH_RST_PV6 / 4] = (Pin[PINMUX_TOUCH_RST_PV6 / 4] & ~0x0FU) | (1U << 6) | (1U << 4);
+  (VOID)Pin[PINMUX_TOUCH_RST_PV6 / 4];
+  R366GpioSet (GPIO_PV_OFFSET, GPIO_OE, 6, FALSE);
+  R366GpioSet (GPIO_PV_OFFSET, GPIO_CNF, 6, TRUE);
+  gBS->Stall (1000);
+  Plugged = R366GpioBit (GPIO_PV_OFFSET, GPIO_IN, 6) == 0;
+  if (Plugged) {
+    Ok &= R395CodecWrite (RT5640_SPK_VOL, (UINT16)(R402_SPK_VOL | R403_MUTE));
+    Ok &= R395CodecWrite (RT5640_HP_VOL, (UINT16)R403_HP_VOL);
+  }
+  Print (L"R403 audio: headphone path %s, PV6 pinmux=%08x in=%u: %s\r\n", Ok ? L"ok" : L"I2C FAIL",
+         Pin[PINMUX_TOUCH_RST_PV6 / 4], R366GpioBit (GPIO_PV_OFFSET, GPIO_IN, 6),
+         Plugged ? L"headphones" : L"speaker");
+}
+
+STATIC VOID R395AudioTone (BOOLEAN PlayTone) {
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  volatile UINT32 *Car = (volatile UINT32 *)CAR_BASE;
+  volatile UINT32 *Admaif = (volatile UINT32 *)APE_ADMAIF_BASE;
+  volatile UINT32 *Xbar = (volatile UINT32 *)APE_XBAR_BASE;
+  volatile UINT32 *I2s = (volatile UINT32 *)APE_I2S1_BASE;
+  // 1 kHz at 48 kHz: one period is 48 samples; amplitude 1/8 of full scale.
+  STATIC CONST INT16 Sine[48] = {
+        0,   535,  1060,  1567,  2048,  2493,  2896,  3250,  3547,  3784,  3956,  4061,
+     4096,  4061,  3956,  3784,  3547,  3250,  2896,  2493,  2048,  1567,  1060,   535,
+        0,  -535, -1060, -1567, -2048, -2493, -2896, -3250, -3547, -3784, -3956, -4061,
+    -4096, -4061, -3956, -3784, -3547, -3250, -2896, -2493, -2048, -1567, -1060,  -535,
+  };
+  UINT32 ClkmKhz, Div;
+  BOOLEAN CodecOk;
+
+  // R396: d_audio on (from clk_m) and APE out of reset before any APE register access.
+  {
+    volatile UINT32 *Pmc = (volatile UINT32 *)PMC_BASE;
+    BOOLEAN Started;
+    Print (L"R396 audio before: RST_V=%08x RST_Y=%08x CLK_V=%08x D_AUDIO src=%08x PMC clamp=%08x\r\n",
+           Car[CAR_RST_DEVICES_V / 4], Car[CAR_RST_DEVICES_Y / 4], Car[CAR_CLK_OUT_ENB_V / 4],
+           Car[CAR_CLK_SOURCE_D_AUDIO / 4], Pmc[PMC_CLAMP_STATUS / 4]);
+    Started = R379ClockOn (CAR_CLK_OUT_ENB_V, CAR_RST_DEVICES_V, CAR_CLK_ENB_V_SET, CAR_RST_DEV_V_SET,
+                           CAR_RST_DEV_V_CLR, CLK_V_D_AUDIO_BIT, CAR_CLK_SOURCE_D_AUDIO, 0xC0000000U);
+    if ((Car[CAR_RST_DEVICES_Y / 4] & CLK_Y_APE_BIT) != 0) {
+      Car[CAR_RST_DEV_Y_CLR / 4] = CLK_Y_APE_BIT;
+      gBS->Stall (10);
+    }
+    Print (L"R396 audio after: d_audio %s RST_V=%08x RST_Y=%08x CLK_V=%08x D_AUDIO src=%08x\r\n",
+           Started ? L"started" : L"already on", Car[CAR_RST_DEVICES_V / 4], Car[CAR_RST_DEVICES_Y / 4],
+           Car[CAR_CLK_OUT_ENB_V / 4], Car[CAR_CLK_SOURCE_D_AUDIO / 4]);
+  }
+
+  // clk_m = 38.4 MHz / (SPARE_REG0[3:2] + 1); I2S1 clock = BCLK = 1.536 MHz (7.1 divider).
+  ClkmKhz = 38400U / (((Car[CAR_SPARE_REG0 / 4] >> 2) & 3U) + 1U);
+  Div = (2U * ClkmKhz) / 1536U - 2U;
+  (VOID)R379ClockOn (CAR_CLK_OUT_ENB_L, CAR_RST_DEVICES_L, CAR_CLK_ENB_L_SET, CAR_RST_DEV_L_SET,
+                     CAR_RST_DEV_L_CLR, CLK_L_I2S1_BIT, CAR_CLK_SOURCE_I2S1, (3U << 30) | Div);
+  Car[CAR_CLK_SOURCE_I2S1 / 4] = (3U << 30) | Div;   // clk_m / ((Div + 2) / 2)
+  gBS->Stall (10);
+  Print (L"R399 audio I2S1 clock: enabled=%u in reset=%u src=%08x\r\n",
+         (Car[CAR_CLK_OUT_ENB_L / 4] >> 30) & 1U, (Car[CAR_RST_DEVICES_L / 4] >> 30) & 1U,
+         Car[CAR_CLK_SOURCE_I2S1 / 4]);
+
+  // DAP1 pins to I2S1 (function 0), Tegra drives SCLK, FS and DOUT.
+  Pin[PINMUX_DAP1_FS / 4] = PINMUX_PULL_DOWN_BITS | PINMUX_INPUT_EN_BIT;
+  Pin[PINMUX_DAP1_SCLK / 4] = PINMUX_PULL_DOWN_BITS | PINMUX_INPUT_EN_BIT;
+  Pin[PINMUX_DAP1_DOUT / 4] = PINMUX_PULL_DOWN_BITS;
+  Pin[PINMUX_DAP1_DIN / 4] = PINMUX_PULL_DOWN_BITS | PINMUX_TRISTATE_BIT | PINMUX_INPUT_EN_BIT;
+  R366GpioSet (GPIO_PB_OFFSET, GPIO_CNF, 0, FALSE);
+  R366GpioSet (GPIO_PB_OFFSET, GPIO_CNF, 1, FALSE);
+  R366GpioSet (GPIO_PB_OFFSET, GPIO_CNF, 2, FALSE);
+  R366GpioSet (GPIO_PB_OFFSET, GPIO_CNF, 3, FALSE);
+
+  // I2S1: master, LRCK (I2S) mode, LRCK low = left, 16 bit, 16 BCLK per channel, data offset 1.
+  Print (L"R396 audio step: first I2S1 read (CTRL)... ");
+  Print (L"%08x\r\n", I2s[I2S_CTRL / 4]);
+  I2s[I2S_ENABLE / 4] = 0;
+  I2s[I2S_RX_INT_MASK / 4] = 3U;               // Linux tegra210_i2s_reg_defaults
+  I2s[I2S_TX_INT_MASK / 4] = 3U;
+  I2s[I2S_TX_CIF_CTRL / 4] = 0x00007700U;
+  I2s[I2S_CG / 4] = 1U;
+  I2s[I2S_CYA / 4] = 1U;
+  I2s[I2S_CTRL / 4] = (1U << 10) | 3U;
+  I2s[I2S_TIMING / 4] = 15U;
+  I2s[I2S_RX_CTRL / 4] = 1U << 8;
+  I2s[I2S_RX_CIF_CTRL / 4] = (3U << 24) | ACIF_16BIT_STEREO;
+  // XBAR: I2S1 takes ADMAIF1.
+  Print (L"R396 audio step: XBAR read %08x, ADMAIF global %08x\r\n", Xbar[XBAR_I2S1_RX_MUX / 4],
+         Admaif[ADMAIF_GLOBAL_ENABLE / 4]);
+  Xbar[XBAR_I2S1_RX_MUX / 4] = 1U;
+  Xbar[(XBAR_I2S1_RX_MUX + 0x200U) / 4] = 0;
+  Xbar[(XBAR_I2S1_RX_MUX + 0x400U) / 4] = 0;
+  // ADMAIF1 TX: 16-bit stereo, written by the CPU.
+  Admaif[ADMAIF_GLOBAL_ENABLE / 4] = 1;
+  Print (L"R397 audio: ADMAIF TX1 FIFO_CTRL was %08x, INT_MASK %08x; writing the Linux defaults\r\n",
+         Admaif[ADMAIF_TX1_FIFO_CTRL / 4], Admaif[ADMAIF_TX1_INT_MASK / 4]);
+  Admaif[ADMAIF_TX1_INT_MASK / 4] = 1U;
+  Admaif[ADMAIF_TX1_FIFO_CTRL / 4] = ADMAIF_TX1_FIFO_CTRL_DEFAULT;
+  Admaif[ADMAIF_TX1_ACIF_CTRL / 4] = ADMAIF_PACK16 | ACIF_16BIT_STEREO;
+  Admaif[ADMAIF_TX1_ENABLE / 4] = 1;
+  // Linux tegra210_i2s_sw_reset for playback, then enable.
+  {
+    UINT32 Cif = I2s[I2S_RX_CIF_CTRL / 4], Stream = I2s[I2S_RX_CTRL / 4], Ctrl = I2s[I2S_CTRL / 4];
+    UINTN Poll;
+    I2s[I2S_RX_SOFT_RESET / 4] = 1;
+    for (Poll = 0; Poll < 1000 && (I2s[I2S_RX_SOFT_RESET / 4] & 1U) != 0; ++Poll) gBS->Stall (10);
+    I2s[I2S_RX_CIF_CTRL / 4] = Cif;
+    I2s[I2S_RX_CTRL / 4] = Stream;
+    I2s[I2S_CTRL / 4] = Ctrl;
+    Print (L"R399 audio I2S1 RX soft reset: %s (%u polls) CTRL=%08x RX_CTRL=%08x RX_CIF=%08x TIMING=%08x\r\n",
+           (I2s[I2S_RX_SOFT_RESET / 4] & 1U) ? L"STUCK" : L"done", (UINT32)Poll,
+           I2s[I2S_CTRL / 4], I2s[I2S_RX_CTRL / 4], I2s[I2S_RX_CIF_CTRL / 4], I2s[I2S_TIMING / 4]);
+  }
+  I2s[I2S_RX_ENABLE / 4] = 1;
+  I2s[I2S_ENABLE / 4] = 1;                     // BCLK and LRCK run from here
+  gBS->Stall (5000);
+
+  CodecOk = R395CodecSetup ();
+  gBS->Stall (50000);                          // codec PLL lock, amp start
+  Print (L"R395 audio tone: clk_m=%u kHz I2S1 div=%u CAR=%08x codec setup %s; ADMAIF st=%08x I2S st=%08x fifo=%08x\r\n",
+         ClkmKhz, Div, Car[CAR_CLK_SOURCE_I2S1 / 4], CodecOk ? L"ok" : L"I2C FAIL",
+         Admaif[ADMAIF_TX1_STATUS / 4], I2s[I2S_RX_STATUS / 4], I2s[I2S_RX_CIF_FIFO_STATUS / 4]);
+
+  // R398: one second of tone through ADMA channel 0.
+  if (PlayTone) {
+    volatile UINT32 *Adma = (volatile UINT32 *)APE_ADMA_BASE;
+    EFI_PHYSICAL_ADDRESS Buffer = 0xFFFFFFFFULL;
+    UINT32 *Words;
+    UINTN Index;
+    if (EFI_ERROR (gBS->AllocatePages (AllocateMaxAddress, EfiBootServicesData, 1, &Buffer))) {
+      Print (L"R398 audio: no buffer below 4 GiB\r\n");
+    } else {
+      Words = (UINT32 *)(UINTN)Buffer;
+      for (Index = 0; Index < 48; ++Index) {
+        Words[Index] = ((UINT32)(UINT16)Sine[Index] << 16) | (UINT16)Sine[Index];   // R:L, S16LE
+      }
+      WriteBackDataCacheRange (Words, 48 * sizeof (UINT32));
+      Print (L"R398 audio step: ADMA global %08x ch0 status %08x... ", Adma[ADMA_GLOBAL_CMD / 4], Adma[ADMA_CH_STATUS / 4]);
+      Adma[ADMA_GLOBAL_CMD / 4] = 1;
+      Adma[ADMA_CH_CMD / 4] = 0;
+      Adma[ADMA_CH_TC / 4] = 48 * sizeof (UINT32);
+      Adma[ADMA_CH_CTRL / 4] = ADMA_CTRL_TX1;
+      Adma[ADMA_CH_LOWER_SRC / 4] = (UINT32)Buffer;
+      Adma[ADMA_CH_LOWER_TRG / 4] = 0;
+      Adma[ADMA_CH_FIFO_CTRL / 4] = ADMA_FIFO_TX3;
+      Adma[ADMA_CH_CONFIG / 4] = ADMA_CONFIG_1BUF;
+      Adma[ADMA_CH_CMD / 4] = 1;
+      Print (L"started\r\n");
+      gBS->Stall (500000);
+      Print (L"R398 audio mid-tone: ADMA st=%08x xfer=%08x ADMAIF st=%08x I2S st=%08x fifo=%08x\r\n",
+             Adma[ADMA_CH_STATUS / 4], Adma[ADMA_CH_XFER_STATUS / 4], Admaif[ADMAIF_TX1_STATUS / 4],
+             I2s[I2S_RX_STATUS / 4], I2s[I2S_RX_CIF_FIFO_STATUS / 4]);
+      Print (L"R399 audio mid-tone: I2S en=%08x rx_en=%08x status=%08x int=%08x rx_int=%08x ADMAIF int=%08x XBAR=%08x\r\n",
+             I2s[I2S_ENABLE / 4], I2s[I2S_RX_ENABLE / 4], I2s[I2S_STATUS / 4], I2s[I2S_INT_STATUS / 4],
+             I2s[I2S_RX_INT_STATUS / 4], Admaif[ADMAIF_TX1_INT_STATUS / 4], Xbar[XBAR_I2S1_RX_MUX / 4]);
+      gBS->Stall (500000);
+      Adma[ADMA_CH_CMD / 4] = 0;
+      gBS->Stall (1000);
+      gBS->FreePages (Buffer, 1);
+    }
+  }
+  gBS->Stall (5000);
+  Print (L"R395 audio tone: done; ADMAIF st=%08x I2S st=%08x fifo=%08x\r\n",
+         Admaif[ADMAIF_TX1_STATUS / 4], I2s[I2S_RX_STATUS / 4], I2s[I2S_RX_CIF_FIFO_STATUS / 4]);
+
+  // R402: leave the path running for Windows; only the speaker level changes.
+  Print (L"R402 audio: left running for Windows, speaker volume %04x: %s\r\n", R402_SPK_VOL,
+         R395CodecWrite (RT5640_SPK_VOL, (UINT16)R402_SPK_VOL) ? L"ok" : L"I2C FAIL");
+  R403Headphones ();
+}
+
+STATIC VOID R390BluetoothPowerOn (VOID) {
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  volatile UINT32 *U = (volatile UINT32 *)UARTD_BASE;
+  CONST UINT8 Reset[4] = { 0x01, 0x03, 0x0C, 0x00 };
+  CONST UINT8 Version[4] = { 0x01, 0x01, 0x10, 0x00 };
+  UINT8 Ev[32];
+  UINTN Len, I;
+  BOOLEAN Pulsed;
+
+  // UART-D pins as in the L4T pinmux (function 0 = UARTD), to the controller.
+  Pin[PINMUX_UART4_TX / 4] = PINMUX_PULL_DOWN_BITS;
+  Pin[PINMUX_UART4_RX / 4] = PINMUX_PULL_DOWN_BITS | PINMUX_TRISTATE_BIT | PINMUX_INPUT_EN_BIT;
+  Pin[PINMUX_UART4_RTS / 4] = PINMUX_PULL_DOWN_BITS;
+  Pin[PINMUX_UART4_CTS / 4] = PINMUX_PULL_DOWN_BITS | PINMUX_TRISTATE_BIT | PINMUX_INPUT_EN_BIT;
+  for (I = 4; I < 8; ++I) R366GpioSet (GPIO_PI_OFFSET, GPIO_CNF, (UINT32)I, FALSE);
+
+  // Power control pins as GPIOs: BT_RST low (off) first, AP_WAKE_BT low (awake).
+  Pin[PINMUX_AP_WAKE_BT / 4] = 0;
+  Pin[PINMUX_BT_RST / 4] = 0;
+  Pin[PINMUX_BT_WAKE_AP / 4] = PINMUX_TRISTATE_BIT | PINMUX_INPUT_EN_BIT;
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OUT, 4, FALSE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OUT, 3, FALSE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OE, 4, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OE, 3, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OE, 5, FALSE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_CNF, 4, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_CNF, 3, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_CNF, 5, TRUE);
+  gBS->Stall (20000);
+
+  // UART-D from PLLP (408 MHz, no clock divider), 115200 8N1, FIFOs on, RTS on.
+  Pulsed = R379ClockOn (CAR_CLK_OUT_ENB_U, CAR_RST_DEVICES_U, CAR_CLK_ENB_U_SET, CAR_RST_DEV_U_SET,
+                        CAR_RST_DEV_U_CLR, CLK_U_UARTD_BIT, CAR_CLK_SOURCE_UARTD, UARTD_CLK_PLLP);
+  ((volatile UINT32 *)CAR_BASE)[CAR_CLK_SOURCE_UARTD / 4] = UARTD_CLK_PLLP;    // also when it was on already
+  gBS->Stall (10);
+  U[UART_IER] = 0;
+  U[UART_LCR] = 0x80U;
+  U[UART_DLL] = UART_DIV_115200 & 0xFFU;
+  U[UART_DLM] = UART_DIV_115200 >> 8;
+  U[UART_LCR] = 0x03U;
+  U[UART_FCR] = 0x07U;
+  U[UART_MCR] = 0x02U;
+
+  // R391: the chip's 32 kHz low-power clock from the PMIC.
+  {
+    UINT8 Ame = 0, K32 = 0, AmeRead = 0;
+    BOOLEAN Ok = i2c_recv_buf_small (&Ame, 1, I2C_5, MAX77620_ADDR, MAX77620_AME_GPIO) == 1 &&
+                 i2c_recv_buf_small (&K32, 1, I2C_5, MAX77620_ADDR, MAX77620_CNFG1_32K) == 1;
+    if (Ok && (Ame & MAX77620_AME_GPIO4) == 0) {
+      i2c_send_byte (I2C_5, MAX77620_ADDR, MAX77620_AME_GPIO, (UINT8)(Ame | MAX77620_AME_GPIO4));
+    }
+    if (Ok) {
+      i2c_recv_buf_small (&AmeRead, 1, I2C_5, MAX77620_ADDR, MAX77620_AME_GPIO);
+    }
+    Print (L"R391 Bluetooth 32k: PMIC AME_GPIO %02x -> %02x (bit 4 = GPIO4 32k-out1) CNFG1_32K %02x %s\r\n",
+           Ame, AmeRead, K32, Ok ? L"" : L"READ FAIL");
+  }
+
+  // Power the chip; the ROM needs some time before it listens.
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OUT, 4, TRUE);
+  gBS->Stall (150000);
+  for (I = 0; I < 4096 && (U[UART_LSR] & UART_LSR_DR) != 0; ++I) (VOID)U[UART_THR];
+
+  R390UartSend (Reset, sizeof (Reset));
+  Len = R390UartEvent (Ev, sizeof (Ev), 500);
+  if (Len < 7) {
+    Print (L"R390 Bluetooth: UART-D clock %s, BT powered, HCI_Reset NO ANSWER (wake PH5=%u)\r\n",
+           Pulsed ? L"started" : L"already on", R366GpioBit (GPIO_PH_OFFSET, GPIO_IN, 5));
+    return;
+  }
+  R390UartSend (Version, sizeof (Version));
+  Len = R390UartEvent (Ev, sizeof (Ev), 500);
+  if (Len < 15 || Ev[1] != 0x0EU || Ev[6] != 0x00U) {
+    Print (L"R390 Bluetooth: HCI_Reset ok, Read_Local_Version FAIL (len %u)\r\n", (UINT32)Len);
+    return;
+  }
+  // 04 0E 0C 01 01 10 status hci_ver hci_rev(2) lmp_ver manufacturer(2) lmp_subver(2)
+  Print (L"R390 Bluetooth: HCI ok, HCI %02x rev %04x LMP %02x maker %04x subver %04x (maker 000f = Broadcom)\r\n",
+         Ev[7], Ev[8] | (Ev[9] << 8), Ev[10], Ev[11] | (Ev[12] << 8), Ev[13] | (Ev[14] << 8));
+}
+
 // Raise VDD_CPU first, park CCLK on PLLP (408 MHz), reprogram and relock
 // PLLX, then return CCLK to PLLX. Any failure puts the old PLLX/voltage back.
 STATIC VOID R364RaiseCpuClock (VOID) {
@@ -3930,12 +4738,13 @@ STATIC VOID EFIAPI RunTest (EFI_EVENT Event, VOID *Context) {
   St->ConOut->SetAttribute (St->ConOut, EFI_WHITE | EFI_BACKGROUND_BLUE);
   St->ConOut->ClearScreen (St->ConOut);
   Print (L"============================================================\r\n");
-  Print (L" Nintendo Switch UEFI XUSB bring-up R378 (ACPI GPIO/buttons/I2C/battery/fan/touch/power button/CPU clock/RTC + USB hot-plug + backlight PWM + touch power + fan + CPU 1020 MHz + USB + hub charging)\r\n");
+  Print (L" Nintendo Switch UEFI XUSB bring-up R405 (ACPI GPIO/buttons/I2C/battery/fan/touch/power button/CPU clock/RTC/sensors/Bluetooth/audio + Wi-Fi PCIe + DSDT WLN0 + USB hot-plug + backlight PWM + touch power + fan + CPU 1020 MHz + USB + hub charging)\r\n");
   Print (L" host or sink gate -> VBUS/charge -> path -> firmware/Falcon -> PADCTL -> XhciDxe\r\n");
   Print (L"============================================================\r\n\r\n");
   Print (L"OTG: USB device directly (Switch supplies VBUS), or a USB-C hub with its\r\n");
   Print (L"charger already connected (Switch charges, still USB host). No PC.\r\n");
   Print (L"XUSB, PADCTL and power settings are left running for the stock USB stack.\r\n\r\n");
+  R388PrintXusbClocks (L"start");
   ZeroMem (mR293Car, sizeof (mR293Car));
   CaptureR293Car (R293_EARLY);
 
@@ -3957,6 +4766,15 @@ STATIC VOID EFIAPI RunTest (EFI_EVENT Event, VOID *Context) {
   R366StartFan ();
   R376BacklightPwm ();
   R373TouchPowerOn ();
+  R379SensorsPowerOn ();
+  R390BluetoothPowerOn ();
+  R393AudioProbe ();
+  if (mR395CodecAnswers) R395AudioTone (SWITCH_AUDIO_TEST_TONE != 0);
+  // R397: the codec went through I2cLib, which leaves I2C1 out of packet mode;
+  // the BM92T reads then failed (R396: "BM92T read FAIL", USB skipped).
+  ((volatile UINT32 *)BASE_ADDR)[CNFG] |= 0x400U;
+  Print (L"R397 I2C1 back to packet mode: %s\r\n", R288LoadI2cConfig () ? L"ok" : L"FAIL");
+  R386PrintGpioIrq ();
 
   if (!R288Read16 (BM_FW_TYPE, &FwType, &S) ||
       !R288Read16 (BM_FW_REV, &FwRev, &S) ||
@@ -5090,10 +5908,530 @@ R35Restore:
   Print (L"Take a clear photo, then hold POWER for 12-15 seconds.\r\n");
 }
 
+// R386: hekate (L4T launcher) can hand over GPIO pins with their interrupt
+// enabled. Windows' GPIO driver (boot start) then gets bank interrupts nobody
+// claims, which never clear: an interrupt storm that froze Windows at the logo
+// in the hekate boot chain. Report them on the console, and mask and clear
+// every GPIO interrupt when the OS takes over (no-op after coreboot).
+#define R386_GPIO_BANKS      8
+#define R386_GPIO_INT_STA    0x40U
+#define R386_GPIO_INT_ENB    0x50U
+#define R386_GPIO_INT_CLR    0x70U
+#define R386_GPIO_MASKED     0x80U
+STATIC EFI_EVENT mR386ExitEvent;
+
+STATIC VOID R386PrintGpioIrq (VOID) {
+  UINT32 Bank, Port, Enb, Sta, Count = 0;
+  Print (L"R386 GPIO interrupts enabled at hand-over:");
+  for (Bank = 0; Bank < R386_GPIO_BANKS; ++Bank) {
+    for (Port = 0; Port < 4; ++Port) {
+      volatile UINT32 *P = (volatile UINT32 *)(GPIO_BASE + Bank * 0x100U + Port * 4U);
+      Enb = P[R386_GPIO_INT_ENB / 4] & 0xFFU;
+      Sta = P[R386_GPIO_INT_STA / 4] & 0xFFU;
+      if (Enb != 0) {
+        Print (L" P%c=%02x/%02x", (CHAR16)(L'A' + Bank * 4 + Port), Enb, Sta);
+        ++Count;
+      }
+    }
+  }
+  Print (Count != 0 ? L" (enable/status; masked at ExitBootServices)\r\n" : L" none\r\n");
+}
+
+STATIC VOID EFIAPI R386MaskGpioIrq (IN EFI_EVENT Event, IN VOID *Context) {
+  UINT32 Bank, Port;
+  for (Bank = 0; Bank < R386_GPIO_BANKS; ++Bank) {
+    for (Port = 0; Port < 4; ++Port) {
+      volatile UINT32 *P = (volatile UINT32 *)(GPIO_BASE + Bank * 0x100U + Port * 4U);
+      P[(R386_GPIO_MASKED + R386_GPIO_INT_ENB) / 4] = 0xFF00U;     // all 8 bits of INT_ENB to 0
+      P[R386_GPIO_INT_CLR / 4] = 0xFFU;
+    }
+  }
+}
+
+// R388: Windows froze at the logo in the hekate L4T chain when it got the
+// XHC0 device; the coreboot chain works. Show the XUSB state the firmware got
+// (clocks, partitions, PLLE) and the one it leaves (pads, ports, Falcon,
+// mailbox) on both chains, so the two can be compared from photos.
+#define R388_CAR_RST_U       0x00CU
+#define R388_CAR_CLK_U       0x018U
+#define R388_CAR_PLLE_BASE   0x0E8U
+#define R388_CAR_PLLE_MISC   0x0ECU
+#define R388_CAR_RST_W       0x35CU
+#define R388_CAR_CLK_W       0x364U
+#define R388_CAR_PLLE_AUX    0x48CU
+#define R388_PMC_PG_STATUS   0x038U
+
+STATIC VOID R388PrintXusbClocks (CONST CHAR16 *Tag) {
+  volatile UINT32 *Car = (volatile UINT32 *)CAR_BASE;
+  volatile UINT32 *Pmc = (volatile UINT32 *)PMC_BASE;
+  Print (L"R388 %s: PG=%08x CLK_U/RST_U=%08x/%08x CLK_W/RST_W=%08x/%08x PLLE=%08x/%08x/%08x\r\n", Tag,
+         Pmc[R388_PMC_PG_STATUS / 4], Car[R388_CAR_CLK_U / 4], Car[R388_CAR_RST_U / 4],
+         Car[R388_CAR_CLK_W / 4], Car[R388_CAR_RST_W / 4],
+         Car[R388_CAR_PLLE_BASE / 4], Car[R388_CAR_PLLE_MISC / 4], Car[R388_CAR_PLLE_AUX / 4]);
+}
+
+STATIC VOID R388PrintXusbState (VOID) {
+  volatile UINT32 *Pad = (volatile UINT32 *)XUSB_PAD_BASE;
+  volatile UINT32 *Hcd = (volatile UINT32 *)XUSB_HCD_BASE;
+  volatile UINT32 *Fpci = (volatile UINT32 *)XUSB_FPCI_BASE;
+  UINT32 OpBase = (Hcd[0] & 0xFFU) / 4, Ports = (Hcd[0x04 / 4] >> 24) & 0xFFU, Port, Range, CpuCtl;
+
+  R388PrintXusbClocks (L"end");
+  Print (L"R388 PAD mux=%08x cap=%08x ssmap=%08x elpg=%08x/%08x usb3mux=%08x uphy=%08x\r\n",
+         Pad[0x004 / 4], Pad[0x008 / 4], Pad[0x014 / 4], Pad[0x020 / 4], Pad[0x024 / 4],
+         Pad[0x028 / 4], Pad[0x360 / 4]);
+  Print (L"R388 HC cmd=%08x sts=%08x ports=%u:", Hcd[OpBase], Hcd[OpBase + 1], Ports);
+  for (Port = 0; Port < Ports && Port < 8; ++Port) {
+    Print (L" %08x", Hcd[OpBase + (0x400 + 0x10 * Port) / 4]);
+  }
+  Print (L"\r\n");
+  Range = Fpci[0x41C / 4];
+  Fpci[0x41C / 4] = 0;
+  CpuCtl = Fpci[(0x800 + 0x100) / 4];
+  Fpci[0x41C / 4] = Range;
+  Print (L"R388 FW cpuctl=%08x mbox cmd=%08x in=%08x out=%08x owner=%08x\r\n",
+         CpuCtl, Fpci[0xE4 / 4], Fpci[0xE8 / 4], Fpci[0xEC / 4], Fpci[0xF0 / 4]);
+}
+
+// R404: Wi-Fi, stage 1. The BCM4356 Wi-Fi function sits on PCIe port 1 (x1,
+// UPHY lane pcie-0), as in the Linux log of this console (00:02.0 [10de:0faf]
+// -> 01:00.0 [14e4:43ec], BAR2 4 MB at 0x13000000, BAR0 32 KB at 0x13400000).
+// The sequence follows U-Boot pci_tegra.c / tegra210 xusb-padctl.c / clock.c:
+// rails and pins, PCIE partition, AFI, PLLE, UPHY PLL P0, controller, port 1
+// reset, link, then the root port and the endpoint get bus numbers and BARs and
+// the chip ID is read through BAR0 (window 0x18000000 = ChipCommon). Runs after
+// the XUSB bring-up (which wants PLLE off at its start) and leaves the link up.
+#define R404_PADS            0x01003000UL
+#define R404_AFI             0x01003800UL
+#define R404_RP0             0x01000000UL  // port 0 root port registers (00:01.0, no device)
+#define R404_RP1             0x01001000UL  // port 1 root port registers (00:02.0)
+#define R404_MSELECT         0x50060000UL
+#define R404_CS              0x11FFF000UL  // 4 KiB config window, as Linux ("cs")
+#define R404_CS_SIZE         0x1000UL
+#define R404_CS_FPCI         (0xFE100000U + ((1U << 16) >> 8))   // page of bus 1, dev 0, fn 0
+#define R404_EP_BAR2         0x13000000UL
+#define R404_EP_BAR0         0x13400000UL
+#define R404_MEM_END         0x135FFFFFUL
+#define R404_CAR_RST_U       0x00C
+#define R404_CAR_CLK_U       0x018
+#define R404_CAR_RST_U_SET   0x310
+#define R404_CAR_RST_U_CLR   0x314
+#define R404_CAR_CLK_U_SET   0x330         // R404b wrote 0x328 (CLK_ENB_H_SET): AFI clock stayed off, hang
+#define R404_U_PCIE          (1U << 6)
+#define R404_U_AFI           (1U << 8)
+#define R404_U_PCIEXCLK      (1U << 10)
+#define R404_PG_PCIE         3U
+#define R404_PG_VDEC         4U            // REMOVE_CLAMPING has PCIE and VDEC swapped
+#define MAX77620_LDO1_CFG    0x25          // vdd-pex 1.05 V
+#define MAX77620_LDO7_CFG    0x31          // vdd-gen-pll-edp 1.05 V (PLLE / UPHY)
+#define MAX77620_FPS_LDO1    0x47
+#define MAX77620_FPS_LDO7    0x4D
+#define PINMUX_PEX_L1_RST_PA3    0x044U
+#define PINMUX_PEX_L1_CLKREQ_PA4 0x048U
+#define PINMUX_WIFI_EN_PH0       0x1B4U
+#define PINMUX_WIFI_RST_PH1      0x1B8U
+#define GPIO_PA_OFFSET       0x000U
+// R404b: one line before each stage, so a hang shows where it happened.
+#define R404_AT(S) do { Stage = (S); Print (L"R404 > %s  PG=%08x CLAMP=%08x RST_U=%08x CLK_U=%08x\r\n", Stage, \
+  Pmc[0x038 / 4], Pmc[0x02C / 4], Car[R404_CAR_RST_U / 4], Car[R404_CAR_CLK_U / 4]); } while (0)
+
+STATIC UINT32 R404Wait (volatile UINT32 *Reg, UINT32 Mask, UINT32 Want, UINTN Ms) {
+  UINTN I;
+  for (I = 0; I < Ms * 10; I++) {
+    if ((*Reg & Mask) == Want) break;
+    gBS->Stall (100);
+  }
+  return *Reg;
+}
+
+// LDO on at 1.05 V under software control, if it is off.
+STATIC UINT8 R404Ldo (UINT8 CfgReg, UINT8 FpsReg) {
+  UINT8 Cfg = 0, Fps = 0;
+  if (i2c_recv_buf_small (&Cfg, 1, I2C_5, MAX77620_ADDR, CfgReg) != 1) return 0xEE;
+  if ((Cfg >> 6) == 3) return Cfg;
+  if (i2c_recv_buf_small (&Fps, 1, I2C_5, MAX77620_ADDR, FpsReg) == 1)
+    i2c_send_byte (I2C_5, MAX77620_ADDR, FpsReg, (UINT8)(Fps | 0xC0U));   // FPS source: none
+  i2c_send_byte (I2C_5, MAX77620_ADDR, CfgReg, 0xCA);                      // normal, 800 + 10 x 25 mV
+  gBS->Stall (2000);
+  Cfg = 0;
+  i2c_recv_buf_small (&Cfg, 1, I2C_5, MAX77620_ADDR, CfgReg);
+  return Cfg;
+}
+
+// R404i: count SErrors during the probe instead of stopping in the default
+// handler (DEBUG builds unmask SError, so it arrives right after the access).
+STATIC volatile UINT32 mR404SErrors;
+STATIC UINT64 mR404Esr, mR404Elr;
+
+// R404j: R404i stopped with no message: the faulting load is retried after the
+// handler returns. When the SError comes back at the same ELR, skip that
+// instruction (its result is then garbage, which the photo shows).
+STATIC UINT64 mR404LastElr;
+STATIC UINT32 mR404Repeat, mR404Skipped;
+
+STATIC VOID EFIAPI R404SError (IN EFI_EXCEPTION_TYPE Type, IN OUT EFI_SYSTEM_CONTEXT Context) {
+  UINT64 Elr = Context.SystemContextAArch64->ELR;
+  if (mR404SErrors++ == 0) {
+    mR404Esr = Context.SystemContextAArch64->ESR;
+    mR404Elr = Elr;
+  }
+  if (Elr == mR404LastElr) {
+    if (++mR404Repeat >= 2) {
+      Context.SystemContextAArch64->ELR = Elr + 4;
+      mR404Repeat = 0;
+      mR404Skipped++;
+    }
+  } else {
+    mR404LastElr = Elr;
+    mR404Repeat = 0;
+  }
+}
+
+// R404r: root port setup of the L4T 4.9 driver (tegra_pcie_enable_rp_features and
+// tegra_pcie_apply_sw_war, T210, clk_m 19.2 MHz), the driver this console's Wi-Fi
+// is known to work with. Up to R404q this followed mainline Linux, which leaves
+// out the timers.
+STATIC VOID R404RpFeatures (volatile UINT32 *Rp) {
+  // prod_c_rp from the console's device tree.
+  Rp[0xE84 / 4] = (Rp[0xE84 / 4] & ~0xFFFFU) | 0x0FU;
+  Rp[0xEA4 / 4] = (Rp[0xEA4 / 4] & ~0xFFFFU) | 0x8FU;
+  Rp[0xE90 / 4] = 0x55010000U;
+  Rp[0xE94 / 4] = 0x00000001U;
+  Rp[0xEB0 / 4] = 0x55010000U;
+  Rp[0xEB4 / 4] = 0x00000001U;
+  Rp[0xE8C / 4] = (Rp[0xE8C / 4] & 0xFFFFU) | (0x67U << 16);
+  Rp[0xEAC / 4] = (Rp[0xEAC / 4] & 0xFFFFU) | (0xC7U << 16);
+  Rp[0xF00 / 4] |= (1U << 27) | (1U << 28);                    // opportunistic ACK / UpdateFC
+  Rp[0xFE0 / 4] |= (1U << 23) | (1U << 31) | (0xFU << 16) | (0xFU << 24);   // clock clamps
+  Rp[0xF04 / 4] |= 1U << 21;                                   // L1 ASPM support
+  Rp[0xF4C / 4] |= 1U << 28;                                   // L1/L2 after DLLP done
+  Rp[0xF48 / 4] |= 1U << 13;                                   // AER
+  Rp[0xC00 / 4] = (Rp[0xC00 / 4] & ~(0xFFU << 8)) | (0x1EU << 8);
+  Rp[0xC00 / 4] = (Rp[0xC00 / 4] & ~((3U << 16) | (0x1FU << 19))) | (1U << 16) | (7U << 19);
+  // Software workarounds.
+  Rp[0x0B0 / 4] = (Rp[0x0B0 / 4] & ~0xFU) | 1U;                // target speed Gen1
+  Rp[0xC24 / 4] &= ~(3U << 16);                                // no LTR interrupts
+  Rp[0x03C / 4] |= 0xFFU;
+  Rp[0xF50 / 4] |= (1U << 2) | (1U << 1) | 1U | (1U << 15) | (3U << 5) | (3U << 3) | (3U << 16);
+  Rp[0xC04 / 4] = (Rp[0xC04 / 4] & ~(0x1FFU << 13)) | (0x27U << 13);
+  Rp[0xF44 / 4] = (Rp[0xF44 / 4] & ~(0xFU << 12)) | (0x9U << 12);   // deskew pulse width
+  Rp[0xF00 / 4] = (Rp[0xF00 / 4] & ~(0xFFU << 18)) | (0x60U << 18); // UpdateFC threshold
+  // Timers for a 19.2 MHz clk_m (the hardware defaults assume 25 MHz).
+  Rp[0xE24 / 4] = (Rp[0xE24 / 4] & ~(0xFFU | (0xFFFFU << 8) | (0xFFU << 24))) |
+                  0xAU | (0x180U << 8) | (0xAU << 24);
+  Rp[0xE28 / 4] = (Rp[0xE28 / 4] & ~((0xFFU << 16) | (0xFFU << 24))) | (0x10U << 16) | (0x74U << 24);
+  Rp[0xF30 / 4] = (Rp[0xF30 / 4] & ~(0xFFU | (0x1FFFFU << 14))) |
+                  0x14U | (1U << 8) | (1U << 13) | (0x1770U << 14);
+  Rp[0xC04 / 4] = (Rp[0xC04 / 4] & ~0x1FFFU) | 0x26U;
+  Rp[0xC08 / 4] = (Rp[0xC08 / 4] & ~(0x1FFFU | (0xFFU << 13) | (0xFU << 21))) |
+                  0x4DU | (0x13U << 13) | (0x2U << 21);
+  Rp[0xFE0 / 4] = (Rp[0xFE0 / 4] & ~0xFU) | 0xEU;              // endpoint present
+}
+
+STATIC VOID R404WifiPcie (VOID) {
+  volatile UINT32 *Car = (volatile UINT32 *)CAR_BASE;
+  volatile UINT32 *Pmc = (volatile UINT32 *)PMC_BASE;
+  volatile UINT32 *Pin = (volatile UINT32 *)PINMUX_BASE;
+  volatile UINT32 *Pad = (volatile UINT32 *)XUSB_PAD_BASE;
+  volatile UINT32 *Pads = (volatile UINT32 *)R404_PADS;
+  volatile UINT32 *Afi = (volatile UINT32 *)R404_AFI;
+  volatile UINT32 *Rp = (volatile UINT32 *)R404_RP1;
+  volatile UINT32 *Rp0 = (volatile UINT32 *)R404_RP0;
+  volatile UINT32 *Msel = (volatile UINT32 *)R404_MSELECT;
+  volatile UINT32 *Ep = (volatile UINT32 *)R404_CS;   // bus 1, dev 0, fn 0 (R404_CS_FPCI)
+  UINT8 Ldo1, Ldo7;
+  UINT32 V, PlleWas, UphyWas = 0, Xp = 0, Lnk = 0, Id = 0xFFFFFFFFU, Chip = 0xFFFFFFFFU;
+  CONST CHAR16 *Stage = L"rails";
+  UINTN I, Try;
+  EFI_CPU_ARCH_PROTOCOL *Cpu = NULL;
+
+  if (!EFI_ERROR (gBS->LocateProtocol (&gEfiCpuArchProtocolGuid, NULL, (VOID **)&Cpu)) &&
+      EFI_ERROR (Cpu->RegisterInterruptHandler (Cpu, EXCEPT_AARCH64_SERROR, R404SError)))
+    Cpu = NULL;
+
+  // Rails: vdd-pex (LDO1) and the PLLE / UPHY supply (LDO7).
+  Ldo1 = R404Ldo (MAX77620_LDO1_CFG, MAX77620_FPS_LDO1);
+  Ldo7 = R404Ldo (MAX77620_LDO7_CFG, MAX77620_FPS_LDO7);
+  Print (L"R404 wifi: LDO1(pex)=%02x LDO7(plle)=%02x\r\n", Ldo1, Ldo7);
+  if ((Ldo1 >> 6) != 3 || (Ldo7 >> 6) != 3) goto Done;
+
+  // Wi-Fi power: WIFI_RST PH1 high. R404n: WIFI_EN PH0 high too. Up to R404m it
+  // was low as in the Linux boot-time hog, and the chip answered one config read
+  // only (PCIe core up, Wi-Fi core apparently off).
+  R404_AT (L"pins");
+  Print (L"R404 > PH before: pinmux EN=%08x RST=%08x CNF=%02x OE=%02x OUT=%02x IN=%02x\r\n",
+         Pin[PINMUX_WIFI_EN_PH0 / 4], Pin[PINMUX_WIFI_RST_PH1 / 4],
+         *(volatile UINT32 *)(GPIO_BASE + GPIO_PH_OFFSET + GPIO_CNF) & 0xFFU,
+         *(volatile UINT32 *)(GPIO_BASE + GPIO_PH_OFFSET + GPIO_OE) & 0xFFU,
+         *(volatile UINT32 *)(GPIO_BASE + GPIO_PH_OFFSET + GPIO_OUT) & 0xFFU,
+         *(volatile UINT32 *)(GPIO_BASE + GPIO_PH_OFFSET + GPIO_IN) & 0xFFU);
+  Pin[PINMUX_WIFI_EN_PH0 / 4] = (Pin[PINMUX_WIFI_EN_PH0 / 4] & ~0x7FU) | (1U << 2);
+  Pin[PINMUX_WIFI_RST_PH1 / 4] = (Pin[PINMUX_WIFI_RST_PH1 / 4] & ~0x7FU) | (1U << 2);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OUT, 0, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OUT, 1, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OE, 0, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_OE, 1, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_CNF, 0, TRUE);
+  R366GpioSet (GPIO_PH_OFFSET, GPIO_CNF, 1, TRUE);
+  // PEX_L1_RST_N (PA3) and PEX_L1_CLKREQ_N (PA4) to the PCIe controller (pe1).
+  Pin[PINMUX_PEX_L1_RST_PA3 / 4] = Pin[PINMUX_PEX_L1_RST_PA3 / 4] & ~0x7FU;
+  Pin[PINMUX_PEX_L1_CLKREQ_PA4 / 4] = (Pin[PINMUX_PEX_L1_CLKREQ_PA4 / 4] & ~0x7FU) | (1U << 6);
+  R366GpioSet (GPIO_PA_OFFSET, GPIO_CNF, 3, FALSE);
+  R366GpioSet (GPIO_PA_OFFSET, GPIO_CNF, 4, FALSE);
+  // PEX pads out of deep power down (pex-bias, pex-clk1, pex-clk2).
+  if ((Pmc[0x1BC / 4] & 0x70U) != 0) { Pmc[0x1B8 / 4] = (1U << 30) | 0x70U; gBS->Stall (10); }
+  gBS->Stall (1000000);   // R404k: 1 s after WIFI_RST high (R404j: 150 ms)
+
+  // PCIE partition with its clock and reset, then AFI, then the CML clock.
+  R404_AT (L"partition");
+  Car[R404_CAR_RST_U_SET / 4] = R404_U_PCIEXCLK | R404_U_AFI | R404_U_PCIE;
+  if (!SetPowerPartition (R404_PG_PCIE, TRUE)) goto Done;
+  Car[R404_CAR_CLK_U_SET / 4] = R404_U_PCIE;
+  gBS->Stall (10);
+  Pmc[0x034 / 4] = 1U << R404_PG_VDEC;
+  gBS->Stall (10);
+  if ((Pmc[0x02C / 4] & (1U << R404_PG_PCIE)) != 0) { Pmc[0x034 / 4] = 1U << R404_PG_PCIE; gBS->Stall (10); }
+  if ((Pmc[0x02C / 4] & (1U << R404_PG_PCIE)) != 0) goto Done;
+  Car[R404_CAR_RST_U_CLR / 4] = R404_U_PCIE;
+  Car[R404_CAR_RST_U_CLR / 4] = R404_U_AFI;
+  Car[R404_CAR_CLK_U_SET / 4] = R404_U_AFI;
+  Car[0x48C / 4] = (Car[0x48C / 4] | 1U) & ~2U;
+  // R404q: CLK_W already had PCIERX0-5 (bits 2-7) on, so they are not the cause.
+  R404_AT (L"AFI read");
+  V = Afi[0x0F8 / 4];
+
+  // PLLE 100 MHz (TRM cold boot sequence), unless XUSB already runs it.
+  R404_AT (L"PLLE");
+  PlleWas = Car[0x0E8 / 4];
+  if ((PlleWas & (1U << 31)) == 0) {
+    Car[0x48C / 4] &= ~(1U << 28);
+    Car[0x0EC / 4] &= ~(1U << 13);
+    gBS->Stall (5);
+    Car[0x0E8 / 4] = (Car[0x0E8 / 4] & ~((0x1FU << 24) | (0xFFU << 8) | 0xFFU)) |
+                     (0xEU << 24) | (0x7DU << 8) | 2U;
+    Car[0x0EC / 4] = (Car[0x0EC / 4] | (1U << 8)) & ~((3U << 6) | (3U << 2) | 1U);
+    Car[0x0E8 / 4] |= 1U << 31;
+    if ((R404Wait (&Car[0x0EC / 4], 1U << 11, 1U << 11, 250) & (1U << 11)) == 0) goto Done;
+    V = Car[0x068 / 4];
+    V &= ~((0xFFU << 16) | (0x3FU << 24) | 0x1FFU | (1U << 15) | (1U << 14) | (1U << 10) | (1U << 12));
+    V |= (1U << 16) | (0x23U << 24) | 0x21U;
+    Car[0x068 / 4] = V;
+    gBS->Stall (1);
+    Car[0x068 / 4] = V & ~(1U << 11);
+  }
+
+  // PADCTL: clamps off, UPHY out of reset, lane pcie-0 = pcie-x1 with IDDQ disabled.
+  R404_AT (L"padctl");
+  Pad[0x024 / 4] &= ~(1U << 29); gBS->Stall (100);
+  Pad[0x024 / 4] &= ~(1U << 30); gBS->Stall (100);
+  Pad[0x024 / 4] &= ~(1U << 31);
+  Car[0x2A4 / 4] &= ~(1U << 13);
+  Pad[0x028 / 4] = (Pad[0x028 / 4] & ~(3U << 12)) | (1U << 1);
+
+  // Controller: PLLE under pad control, x4/x1 crossbar with only port 1 on, gen2.
+  R404_AT (L"controller");
+  // R404r: MSELECT as L4T (tegra_pcie_enable_wrap): wrap to incr on for PCIe, error
+  // response off.
+  V = *Msel;
+  *Msel = (V | (1U << 28)) & ~(1U << 24);
+  (VOID)*Msel;
+  Print (L"R404 > MSELECT=%08x->%08x src=%08x\r\n", V, *Msel, Car[0x3B4 / 4]);
+  // R404l: PLLE stays on: bypass the pads-to-PLLE power-down (Linux allows it, but
+  // also starts the PLLE hardware sequencer, which this code does not).
+  Afi[0x160 / 4] = (Afi[0x160 / 4] & ~(1U << 1)) | (1U << 9);
+  Afi[0x168 / 4] = 0;
+  V = Afi[0x0F8 / 4] & ~(0xFU << 20);
+  // R404h: CLKREQ as Linux: all ports' CLKREQ_GPIO set, then cleared for port 1.
+  // R404r: both ports on while the link comes up, as L4T; port 0 goes off afterwards.
+  Afi[0x0F8 / 4] = (V | 0xEU | (1U << 20) | (7U << 29)) & ~((1U << 1) | (1U << 2) | (1U << 29) | (1U << 30));
+  Afi[0x104 / 4] &= ~(1U << 2);
+
+  // UPHY PLL P0: calibration, lock, register calibration (unless already locked).
+  R404_AT (L"UPHY PLL");
+  UphyWas = Pad[0x360 / 4];
+  if ((UphyWas & (1U << 15)) == 0) {
+    Pad[0x364 / 4] = (Pad[0x364 / 4] & ~(0xFFFFFFU << 4)) | (0x136U << 4);
+    Pad[0x370 / 4] = (Pad[0x370 / 4] & ~(0xFFU << 16)) | (0x2AU << 16);
+    Pad[0x360 / 4] |= 1U << 4;
+    Pad[0x364 / 4] |= 1U << 2;
+    Pad[0x37C / 4] |= 1U << 15;
+    Pad[0x36C / 4] = (Pad[0x36C / 4] & ~((3U << 12) | (0xFU << 4))) | (2U << 12) | (1U << 15);
+    Pad[0x360 / 4] = (Pad[0x360 / 4] & ~((3U << 16) | (0xFFU << 20))) | (25U << 20);
+    Pad[0x360 / 4] &= ~1U;
+    Pad[0x360 / 4] &= ~(3U << 1);
+    gBS->Stall (1);
+    Pad[0x36C / 4] |= 1U << 8;
+    Pad[0x364 / 4] |= 1U;
+    if ((R404Wait (&Pad[0x364 / 4], 2U, 2U, 250) & 2U) == 0) goto Done;
+    Pad[0x364 / 4] &= ~1U;
+    if ((R404Wait (&Pad[0x364 / 4], 2U, 0, 250) & 2U) != 0) goto Done;
+    Pad[0x360 / 4] |= 1U << 3;
+    if ((R404Wait (&Pad[0x360 / 4], 1U << 15, 1U << 15, 250) & (1U << 15)) == 0) goto Done;
+    Pad[0x37C / 4] |= (1U << 13) | (1U << 12);
+    if ((R404Wait (&Pad[0x37C / 4], 1U << 31, 1U << 31, 250) & (1U << 31)) == 0) goto Done;
+    Pad[0x37C / 4] &= ~(1U << 12);
+    if ((R404Wait (&Pad[0x37C / 4], 1U << 31, 0, 250) & (1U << 31)) != 0) goto Done;
+    Pad[0x37C / 4] &= ~(1U << 13);
+  }
+
+  // FPCI on, AFI interrupts off. R404r: PCIEXCLK stays in reset until the ports are set.
+  R404_AT (L"FPCI");
+  // R404h: CLKEN_OVERRIDE (bit 31) turns AFI dynamic clock gating off, as
+  // Linux does. Without it the first config read worked and the next one
+  // raised an SError (R404f/g).
+  Afi[0x0AC / 4] |= 1U | (1U << 31);
+  // R404o: AFI error reporting as Linux (the GIC line stays off in UEFI; the
+  // code is read and cleared by hand before each endpoint access).
+  Afi[0x0C8 / 4] = 0x13FU; Afi[0x0C4 / 4] = 0xFFFFFFFFU; Afi[0x0B4 / 4] = 1U; Afi[0x0B0 / 4] = 0;
+  Afi[0x0B8 / 4] = 0;
+
+  // Translations: BAR0 config, BAR1 I/O, BAR2 prefetchable, BAR3 memory.
+  Afi[0x018 / 4] = (UINT32)R404_CS;    Afi[0x000 / 4] = (UINT32)(R404_CS_SIZE >> 12); Afi[0x030 / 4] = R404_CS_FPCI;
+  Afi[0x01C / 4] = 0x12000000U;        Afi[0x004 / 4] = 0x10000U >> 12;               Afi[0x034 / 4] = 0xFDFC0000U;
+  Afi[0x020 / 4] = 0x20000000U;        Afi[0x008 / 4] = 0x20000000U >> 12;            Afi[0x038 / 4] = (0x20000U << 4) | 1U;
+  Afi[0x024 / 4] = 0x13000000U;        Afi[0x00C / 4] = 0x0D000000U >> 12;            Afi[0x03C / 4] = (0x13000U << 4) | 1U;
+  Afi[0x028 / 4] = 0; Afi[0x010 / 4] = 0; Afi[0x040 / 4] = 0;
+  Afi[0x02C / 4] = 0; Afi[0x014 / 4] = 0; Afi[0x044 / 4] = 0;
+  Afi[0x064 / 4] = 0; Afi[0x060 / 4] = 0; Afi[0x068 / 4] = 0;
+
+  // R404r: link bring-up in the order of L4T tegra_pcie_check_ports. The MBIST
+  // workaround (PCA_ENABLE) belongs on root port 0 even with nothing behind it, and
+  // only during this step; R404h-q had it on port 1, and port 0 was off. The port
+  // setup is done while PCIEXCLK is in reset; up to R404q the link was already
+  // training during it.
+  R404_AT (L"link");
+  Pads[0x0C8 / 4] = 0x90B890B8U;
+  Rp0[0xFA8 / 4] |= 1U << 7;
+  for (I = 0; I < 2; I++) {
+    UINT32 Ctl = I == 0 ? 0x110U : 0x118U;
+    // No CLKREQ_EN (bit 1): L4T clears it when the DT has no disable-clock-request.
+    Afi[Ctl / 4] = (Afi[Ctl / 4] & ~(1U << 1)) | (1U << 3) | (1U << 4);
+    Afi[Ctl / 4] &= ~1U; gBS->Stall (2000); Afi[Ctl / 4] |= 1U;
+    R404RpFeatures (I == 0 ? Rp0 : Rp);
+    Print (L"R404 > port %u set: CTL=%08x XP=%08x\r\n", (UINT32)I, Afi[Ctl / 4], (I == 0 ? Rp0 : Rp)[0xF00 / 4]);
+  }
+  gBS->Stall (100);
+  Car[R404_CAR_RST_U_CLR / 4] = R404_U_PCIEXCLK;
+  gBS->Stall (20000);
+  R404_AT (L"wait link");
+  for (Try = 0; Try < 3; Try++) {
+    Xp = R404Wait (&Rp[0xF00 / 4], 1U << 30, 1U << 30, 400);
+    if ((Xp & (1U << 30)) != 0) {
+      Lnk = R404Wait (&Rp[0x090 / 4], 1U << 29, 1U << 29, 400);
+      if ((Lnk & (1U << 29)) != 0) break;
+    }
+    Afi[0x118 / 4] &= ~1U; gBS->Stall (2000); Afi[0x118 / 4] |= 1U;
+  }
+  // Port 0 has no device (sw-link-disable in the DT): off again, workaround off.
+  Afi[0x0F8 / 4] |= (1U << 1) | (1U << 29);
+  Rp0[0xFA8 / 4] &= ~(1U << 7);
+  if ((Lnk & (1U << 29)) == 0) goto Done;
+
+  // Root port: bus 0 -> 1, memory window, memory + bus master. Endpoint: BARs, memory.
+  R404_AT (L"config");
+  Rp[0x018 / 4] = (Rp[0x018 / 4] & 0xFF000000U) | 0x00010100U;
+  Rp[0x020 / 4] = ((UINT32)(R404_MEM_END >> 16) & 0xFFF0U) << 16 | (((UINT32)R404_EP_BAR2 >> 16) & 0xFFF0U);
+  Rp[0x004 / 4] = (Rp[0x004 / 4] & 0xFFFF0000U) | 0x6U;
+  // R404e: the U-Boot 256 MB config window gave garbage (R404c: 01002080) and
+  // then an SError (R404d). Use the Linux one: a 4 KiB AXI window at 0x11fff000
+  // whose FPCI page is moved per access; bus 1 dev 0 regs 0-0xff are one page.
+  // R404g: R404f read 43EC14E4 (BCM4356 Wi-Fi) right after link-up, the link
+  // stayed up for 300 ms, but an endpoint read 300 ms later never came back
+  // (R404d/e: SError). So do all the endpoint setup at once after link-up,
+  // and after that only look at root port registers.
+  // R404i: R404h (Linux fixups) still stopped here. An SError handler now
+  // counts SErrors instead of stopping, and the count is taken after each
+  // endpoint access (S0..S8), so the photo shows which access faults.
+  {
+    UINT32 Lk[6], Vx[6], Cls = 0, Win = 0, Cmd = 0, S[9], Aer = 0, Ext;
+    #define R404_STEP(N) do { ArmDataSynchronizationBarrier (); gBS->Stall (20); S[N] = mR404SErrors; } while (0)
+    // R404p: R404o showed no AFI error after ep 0 (code A = presence change,
+    // before it), yet ep 1 hung. Show the root port's own error logs (device
+    // status, AER uncorrectable/correctable: receiver error, bad TLP/DLLP,
+    // replay timeouts, completion timeout) and XP state before each access.
+    for (Ext = 0x100U, I = 0; I < 16 && Ext >= 0x100U && Ext < 0x1000U; I++) {
+      UINT32 H = Rp[Ext / 4];
+      if ((H & 0xFFFFU) == 1U) { Aer = Ext; break; }
+      Ext = H >> 20;
+    }
+    // R404k: R404j read ep 0 and then hung on ep 1 (no SError). Linux writes
+    // AFI_FPCI_BAR0 before every config access; do the same.
+    #define R404_EP(N) do { Print (L"R404 > ep %u (SErr %u) LNK=%08x XP=%08x DEVSTA=%08x AER@%x UE=%08x CE=%08x AFI=%x\r\n", \
+      (UINT32)(N), mR404SErrors, Rp[0x090 / 4], Rp[0xF00 / 4], Rp[0x088 / 4], Aer, \
+      Aer ? Rp[(Aer + 4) / 4] : 0, Aer ? Rp[(Aer + 0x10) / 4] : 0, Afi[0x0B8 / 4]); \
+      if (Aer) { Rp[(Aer + 4) / 4] = 0xFFFFFFFFU; Rp[(Aer + 0x10) / 4] = 0xFFFFFFFFU; } \
+      Afi[0x0B8 / 4] = 0; \
+      Afi[0x030 / 4] = R404_CS_FPCI; (VOID)Afi[0x030 / 4]; ArmDataSynchronizationBarrier (); } while (0)
+    // R404m: R404l kept PLLE/UPHY locked and the link up, yet ep 1 hung. Guess:
+    // after the first access the BCM4356 answers with CRS (retry) and the root
+    // port retries silently. Turn CRS Software Visibility on, so a vendor ID
+    // read returns 0x0001 while the chip is busy, and poll until it is back.
+    {
+      UINT32 Cap = Rp[0x034 / 4] & 0xFCU, RootCaps = 0, Seen[6], NSeen = 0, Ms = 0, V0;
+      for (I = 0; I < 16 && Cap >= 0x40U && Cap < 0x100U; I++) {
+        V0 = Rp[Cap / 4];
+        if ((V0 & 0xFFU) == 0x10U) break;
+        Cap = (V0 >> 8) & 0xFCU;
+      }
+      if (Cap >= 0x40U && Cap < 0x100U && (Rp[Cap / 4] & 0xFFU) == 0x10U) {
+        RootCaps = Rp[(Cap + 0x1C) / 4];
+        Rp[(Cap + 0x1C) / 4] = (RootCaps & 0xFFFFU) | (1U << 4);    // Root Control: CRSSVE
+      }
+      // R404n: the 5 s vendor ID poll (R404m) hung on its second read; dropped.
+      (VOID)Seen; (VOID)NSeen; (VOID)Ms;
+      Print (L"R404 > CRS SV: cap=%02x rootcaps/ctl=%08x->%08x\r\n",
+             Cap, RootCaps, Cap < 0x100U ? Rp[(Cap + 0x1C) / 4] : 0);
+    }
+    ZeroMem (S, sizeof (S));
+    R404_EP (0); Id = Ep[0];                                   R404_STEP (0);
+    R404_EP (1); Cls = Ep[0x08 / 4];                           R404_STEP (1);
+    R404_EP (2); Ep[0x10 / 4] = (UINT32)R404_EP_BAR0; Ep[0x14 / 4] = 0; R404_STEP (2);
+    R404_EP (3); Ep[0x18 / 4] = (UINT32)R404_EP_BAR2; Ep[0x1C / 4] = 0; R404_STEP (3);
+    R404_EP (4); Ep[0x04 / 4] = 0x2U;                          R404_STEP (4);   // memory space on
+    R404_EP (5); Ep[0x80 / 4] = 0x18000000U;                   R404_STEP (5);   // BAR0 window -> ChipCommon
+    R404_EP (6); Win = Ep[0x80 / 4];                           R404_STEP (6);
+    R404_EP (7); Cmd = Ep[0x04 / 4];                           R404_STEP (7);
+    R404_EP (8); if (mR404SErrors == 0) Chip = *(volatile UINT32 *)R404_EP_BAR0;
+    R404_STEP (8);
+    #undef R404_EP
+    #undef R404_STEP
+    for (I = 0; I < 6; I++) { gBS->Stall (50000); Lk[I] = Rp[0x090 / 4]; Vx[I] = Rp[0xF00 / 4]; }
+    Print (L"R404 > config: RP ID=%08x BUS=%08x CMD=%08x\r\n", Rp[0], Rp[0x018 / 4], Rp[0x004 / 4]);
+    Print (L"R404 > EP ID=%08x CLASS=%08x CMD=%08x WIN=%08x CHIP=%08x\r\n", Id, Cls, Cmd, Win, Chip);
+    Print (L"R404 > SErrors after id/cls/bar0/bar2/cmd/win/win/cmd/chip: %u %u %u %u %u %u %u %u %u\r\n",
+           S[0], S[1], S[2], S[3], S[4], S[5], S[6], S[7], S[8]);
+    Print (L"R404 > first SError: ESR=%08x ELR=%lx (R404WifiPcie at %p) AFI INTR CODE=%08x SIG=%08x\r\n",
+           mR404Esr, mR404Elr, (VOID *)R404WifiPcie, Afi[0x0B8 / 4], Afi[0x0BC / 4]);
+    Print (L"R404 > link 50..300 ms: %08x %08x %08x %08x %08x %08x\r\n", Lk[0], Lk[1], Lk[2], Lk[3], Lk[4], Lk[5]);
+    Print (L"R404 > XP   50..300 ms: %08x %08x %08x %08x %08x %08x\r\n", Vx[0], Vx[1], Vx[2], Vx[3], Vx[4], Vx[5]);
+    Lnk = Lk[5]; Xp = Vx[5];
+  }
+  if ((Id & 0xFFFFU) != 0x14E4U) goto Done;
+  Stage = L"done";
+
+Done:
+  Print (L"R404 wifi: %s. PLLE=%08x UPHY=%08x->%08x XP=%08x LNK=%08x ID=%08x chip=%08x\r\n",
+         Stage, Car[0x0E8 / 4], UphyWas, Pad[0x360 / 4], Xp, Lnk, Id, Chip);
+  if ((Chip & 0xFFFFU) == 0x4356U)
+    Print (L"R404 wifi: BCM4356 rev %u found on PCIe.\r\n", (Chip >> 16) & 0xFU);
+  Print (L"R404 wifi: SErrors caught %u, skipped %u (handler %s)\r\n", mR404SErrors, mR404Skipped,
+         Cpu != NULL ? L"on" : L"MISSING");
+  gBS->Stall (3000000);   // R405: 3 s (was 8 s) to see the R404 lines; R404r works
+  if (Cpu != NULL) Cpu->RegisterInterruptHandler (Cpu, EXCEPT_AARCH64_SERROR, NULL);
+}
+
+// RunTest, then the Wi-Fi PCIe probe (after XUSB has taken PLLE).
+STATIC VOID EFIAPI R404RunAll (EFI_EVENT Event, VOID *Context) {
+  RunTest (Event, Context);
+  R404WifiPcie ();
+}
+
 EFI_STATUS EFIAPI UsbPowerAuditEntryPoint (
   IN EFI_HANDLE ImageHandle, IN EFI_SYSTEM_TABLE *SystemTable) {
-  EFI_STATUS E = gBS->CreateEvent (EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
-                                   RunTest, SystemTable, &mStartEvent);
+  EFI_STATUS E;
+  gBS->CreateEvent (EVT_SIGNAL_EXIT_BOOT_SERVICES, TPL_NOTIFY, R386MaskGpioIrq, NULL, &mR386ExitEvent);
+  E = gBS->CreateEvent (EVT_TIMER | EVT_NOTIFY_SIGNAL, TPL_CALLBACK,
+                        R404RunAll, SystemTable, &mStartEvent);
   if (EFI_ERROR (E)) return E;
   E = gBS->SetTimer (mStartEvent, TimerRelative, 10ULL * 1000ULL * 1000ULL * 10ULL);
   if (EFI_ERROR (E)) gBS->CloseEvent (mStartEvent);

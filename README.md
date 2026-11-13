@@ -2,7 +2,7 @@
 
 ![Windows for Switch](docs/images/social-preview.png)
 
-Windows 10 on ARM (Windows 10 IoT Enterprise LTSC 2021, build 19044, ARM64) on the
+Windows on ARM (ARM64) on the
 original Nintendo Switch (Tegra210 "Erista", unpatched units that can enter RCM),
 booted from microSD with coreboot + EDK2 UEFI.
 
@@ -25,23 +25,28 @@ EDK2 platform package, whose history is kept here). It adds:
 | Feature | How |
 |---|---|
 | Boot to the desktop from microSD | RCM → coreboot → UEFI (this package) → Windows Boot Manager on the SD |
-| USB host: HS and FS, hubs, keyboard, mouse, storage, RTL8153 Ethernet | UEFI brings XUSB up and leaves it running; Windows inbox `USBXHCI` |
+| USB host: HS and FS, hubs, keyboard, mouse, storage, RTL8153 Ethernet | UEFI brings XUSB up and leaves it running; Windows inbox `USBXHCI`. Since R389 the DSDT shows XHC0 only when XUSB came up |
 | USB-C hot-plug under Windows (device: VBUS on/off; charger hub: charge + host) | UEFI R378 starts XUSB even with nothing attached; `switchbattery.sys` v4 watches the BM92T |
 | Charging through a USB-C PD hub | UEFI: BM92T sink + BQ24193 charge mode + DR_SWAP to host |
 | CPU at 1020 MHz at boot; selectable 614–1766 MHz in Windows | UEFI (PLLX + MAX77621) + `switchcpu.sys` + tray app |
 | Fan (temperature controlled) | UEFI + `switchfan.sys` |
 | Backlight brightness; off when Windows turns the display off | UEFI R376 (PWM0) + `switchfan.sys` v2 + tray app |
-| Volume buttons | DSDT `ACPI0011` + GPIO driver + inbox `hidinterrupt` |
+| Volume buttons | DSDT `ACPI0011` + GPIO driver + inbox `hidinterrupt`; 20 ms debounce since R389 |
 | Power button (display off / lock) | `switchpwrbtn.sys` (MAX77620 EN0) |
 | Battery level, AC, charging | `switchbattery.sys` (MAX17050 + BQ24193) |
 | Touch screen: multi-touch, press-and-hold | UEFI powers the FTM4 + `switchtouch.sys` |
+| Screen auto-rotation | UEFI R379 (SPI4/I2C2 clocks, DSDT SENS) + `switchsensor.sys` (LSM6DS3H) + tray app |
+| Bluetooth (keyboard, audio) | UEFI R390 (chip power, DSDT BTH0) + `switchbt.sys` + inbox BthMini. Bring your own `BCM4356A3.hcd` patch. Range is very short for now |
+| Wi-Fi (beta): WPA2-Personal connect, DHCP, internet access; Wi-Fi 5 (802.11ac), 866/866 Mbit/s | UEFI R404/R405 (PCIe port 1, BCM4356, DSDT WLN0) + `switchwlan.sys` 0.6.13 (beta, in Windows-for-Switch-Drivers). Bring your own `brcmfmac4356(A3)-pcie.bin/.txt` firmware (tested 7.35.252.108). Tested 2026-11-08: fast.com 55 Mbit/s down / 39 Mbit/s up |
+| Audio: speakers and the 3.5 mm headphone jack (switches automatically when headphones are plugged in or out) | UEFI R402 (APE clocks, ADMA/ADMAIF/XBAR/I2S1, ALC5639 codec, DSDT AUD0) and R403 (headphone path, jack switch PV6) + `switchaudio.sys` 1.0.0.7 (PortCls WaveRT, 48 kHz 16-bit stereo) |
 | Clock kept across reboots | `switchrtc.sys` reads the MAX77620 RTC (never writes it, Horizon keeps using it) and applies an offset learned at the last time sync |
 
-Not done: GPU acceleration (basic display only), audio, Wi-Fi/BT, Joy-Con rail, sleep.
+Not done: GPU acceleration (basic display only), Joy-Con rail, sleep.
+Audio limits: the speakers and the headphones are one Windows output ("Speakers") and share one volume, so turn the volume down before plugging headphones in; the codec level is fixed (speakers -18 dB, headphones -24 dB); no microphone.
 
 ## Tested OS
 
-- Windows 10 IoT Enterprise LTSC 2021 (build 19044), ARM64
+- Windows 11 Arm64 22H2 (build 22621)
 
 Bring your own Windows image and license. This repository does not contain Windows.
 
@@ -53,7 +58,7 @@ Bring your own Windows image and license. This repository does not contain Windo
 | `Firmware/` | Put the XUSB firmware here (not included; see its README). |
 | `patches/edk2/` | One fix for edk2 `XhciDxe`: allocate non-coherent DMA buffers write-combined. |
 | `patches/coreboot/` | Build fixes for [imbushuo/Coreboot](https://github.com/imbushuo/Coreboot) with current toolchains. |
-| `Tools/uefi/package-R378.sh` | The script the tested image was built with (paths are those of the original setup). |
+| `Tools/uefi/package-R3xx.sh` | The scripts the tested images were built with (paths are those of the original setup). Current: `package-R403.sh`. |
 | `Tools/rcm-mac/` | Sending the payload from macOS with shofel2. |
 | `windows/` | Setup helpers: the login fix and the driver inventory script. The drivers themselves are in [Windows-for-Switch-Drivers](https://github.com/hayato41200/Windows-for-Switch-Drivers). |
 | `docs/ja/uefi-revisions/` | Per-revision notes and hardware results for the UEFI test images (Japanese). |
@@ -61,21 +66,37 @@ Bring your own Windows image and license. This repository does not contain Windo
 ## Building the UEFI payload
 
 1. Check out edk2 `edk2-stable202102`. Apply `patches/edk2/*.patch` (`patch -p1`).
-2. Put this repository at `edk2/NintendoSwitchPkg`. Add the XUSB firmware as described
-   in `Firmware/README.md`.
+2. Put this repository at `edk2/NintendoSwitchPkg`.
 3. Build `NintendoSwitchPkg/NintendoSwitch.dsc` for AARCH64 with GCC5.
 4. Wrap `TEGRA210_EFI.fd` as an ELF payload and add it to a coreboot ROM built from
    imbushuo/Coreboot (with `patches/coreboot`), as `fallback/payload`.
-   - `Tools/uefi/package-R378.sh` shows the exact commands: `objcopy` + `FvWrapper.ld` + `cbfstool`.
-5. Send the ROM in RCM with shofel2. From Linux:
+   - `Tools/uefi/package-R403.sh` shows the exact commands: `objcopy` + `FvWrapper.ld` + `cbfstool`.
+5. Put the XUSB (USB host) firmware at the root of the SD card's ESP as `tegra21x_xusb_firmware`
+   (see `Firmware/README.md`). The UEFI reads it from there at every boot; without it USB does not work.
+   For a private build you can embed it instead with `-D EMBED_XUSB_FIRMWARE=TRUE`.
+6. Send the ROM in RCM with shofel2. From Linux:
    `shofel2.py cbfs.bin coreboot.rom`. For macOS, see `Tools/rcm-mac/`.
+
+## Which UEFI revision
+
+Use R403 (notes: `docs/ja/uefi-revisions/R403-README-ja.md`). It is R392 plus audio: the speakers (R402) and the headphones (R403) for `switchaudio.sys`. Tested on the console on 2026-11-02.
+
+- R404/R405 are the Wi-Fi bring-up (beta): R404 brings up PCIe port 1 (BCM4356), R405 adds DSDT WLN0 (`ACPI\SWOA0D01`) for `switchwlan.sys`. Use R403 for a tested setup; use R404/R405 only if you want the Wi-Fi beta.
+- R392 (notes: `docs/ja/uefi-revisions/R392-README-ja.md`) is R390 with the XUSB firmware read from the ESP and the Bluetooth UART clock reset at every boot. Everything after it builds on it. Do not use R391: its UART clock setting is wrong.
+- R393–R401 are the audio bring-up (notes: `docs/ja/uefi-revisions/R401-README-ja.md`). R400 played a test tone at boot; R401 turns that tone off by default.
+
+## No prebuilt ROM
+
+Built ROMs (coreboot + UEFI) are not published; build your own as above.
+- The coreboot part carries memory-training data from the console (`nx_abca2_0_3.bin`, `tegra_mtc_table_*.bin`), which cannot be redistributed.
+- NVIDIA's XUSB firmware: linux-firmware's `LICENCE.nvidia` allows redistribution only for use on open source operating systems. Since R392 the image does not contain it (unless you embed it yourself), and you supply your own copy on the ESP.
 
 ## Installing the Windows drivers
 
 The drivers, their install kits and the control center (SwitchCenter) are in
 [Windows-for-Switch-Drivers](https://github.com/hayato41200/Windows-for-Switch-Drivers).
 Download the release ZIPs there and follow its README (test signing, then GPIO, I2C,
-battery, fan, touch, power button, CPU clock and RTC). The control center can then
+battery, fan, touch, power button, CPU clock, RTC, sensors, Bluetooth, audio and Wi-Fi (beta)). The control center can then
 update the drivers over the air.
 
 ## Credits
@@ -85,6 +106,7 @@ update the drivers over the air.
   sequences for the fan, touch panel, backlight, PMIC and charger.
 - The Linux kernel Tegra drivers and device trees, e.g. the CPU CVB tables.
 - fail0verflow: shofel2.
+- Claude: Thank you for managing this GitHub repository and writing the README.
 
 ## License
 

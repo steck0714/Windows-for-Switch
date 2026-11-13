@@ -142,9 +142,15 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
                 }
             })
 
+            // R389: hidden unless UsbPowerAuditDxe brought XUSB up. It patches
+            // this byte (AML 08 'XSTA' 0A 10) to 0x0F and fixes the checksum.
+            // usbxhci touching an XUSB that was never started froze Windows
+            // at the logo (hekate chain, when the charger set-up stopped).
+            Name (XSTA, 0x10)
+
             Method (_STA, 0, NotSerialized)
             {
-                Return (0x0F)
+                Return (XSTA)
             }
         }
 
@@ -184,13 +190,16 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
         {
             Name (_HID, "ACPI0011")    // R369: ACPI 6.0 Generic Buttons Device (hidinterrupt.inf)
             Name (_UID, Zero)
+            // R389: debounce 20 ms (units of 10 us). With 0 a bounce could
+            // swallow the release edge, and Windows auto-repeated the key to
+            // the volume limit. tegra210gpio asks GpioClx to emulate it.
             Name (_CRS, ResourceTemplate ()
             {
-                GpioInt (Edge, ActiveBoth, Exclusive, PullUp, 0x0000, "\\_SB.GPI0", 0x00, ResourceConsumer, ,)
+                GpioInt (Edge, ActiveBoth, Exclusive, PullUp, 0x07D0, "\\_SB.GPI0", 0x00, ResourceConsumer, ,)
                 {
                     190     // PX6: volume up
                 }
-                GpioInt (Edge, ActiveBoth, Exclusive, PullUp, 0x0000, "\\_SB.GPI0", 0x00, ResourceConsumer, ,)
+                GpioInt (Edge, ActiveBoth, Exclusive, PullUp, 0x07D0, "\\_SB.GPI0", 0x00, ResourceConsumer, ,)
                 {
                     191     // PX7: volume down
                 }
@@ -319,6 +328,106 @@ DefinitionBlock("DsdtTable.aml", "DSDT", 1, "NVIDIA", "TEGRA210", EFI_ACPI_ARM_O
             {
                 I2cSerialBusV2 (0x0049, ControllerInitiated, 400000, AddressingMode7Bit, "\\_SB.I2C3", 0x00, ResourceConsumer, , Exclusive, )
                 GpioInt (Level, ActiveLow, Exclusive, PullUp, 0x0000, "\\_SB.GPI0", 0x00, ResourceConsumer, , ) { 185 }
+            })
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
+        // R379: I2C2 (GEN2_I2C) for the light sensor. UEFI R379 enables the
+        // I2C2 clock and pins. GIC SPI 84 = GSI 116.
+        Device (I2C2)
+        {
+            Name (_HID, "SWOA0201")
+            Name (_UID, 0x02)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadWrite, 0x7000C400, 0x00000100)
+                Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 0x00000074 }
+            })
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
+        // R379: sensors for switchsensor.sys (ACPI\SWOA0901). SPI4 controller
+        // (the driver runs it in PIO mode; IMU LSM6DS3H on CS0, UEFI R379
+        // clocks it) and the BH1730FVC light sensor 0x29 on I2C2.
+        Device (SENS)
+        {
+            Name (_HID, "SWOA0901")
+            Name (_UID, Zero)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadWrite, 0x7000DA00, 0x00000200)
+                I2cSerialBusV2 (0x0029, ControllerInitiated, 400000, AddressingMode7Bit, "\\_SB.I2C2", 0x00, ResourceConsumer, , Exclusive, )
+            })
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
+        // R390: Bluetooth for switchbt.sys (ACPI\SWOA0B01). BCM4356A3 on UART-D
+        // (GIC SPI 90 = GSI 122, level high). UEFI R390 sets the pins, clocks
+        // the UART and powers the chip (PH4).
+        Device (BTH0)
+        {
+            Name (_HID, "SWOA0B01")
+            Name (_UID, Zero)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadWrite, 0x70006300, 0x00000040)
+                Interrupt (ResourceConsumer, Level, ActiveHigh, Exclusive) { 0x0000007A }
+            })
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
+        // R402: audio for switchaudio.sys (ACPI\SWOA0C01). AHUB (ADMAIF, XBAR,
+        // I2S1 at 0x702D1000), ADMA, and the ALC5639 codec on I2C1. UEFI turns
+        // on the APE clocks, sets up the codec and starts I2S1.
+        Device (AUD0)
+        {
+            Name (_HID, "SWOA0C01")
+            Name (_UID, Zero)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadWrite, 0x702D0000, 0x00002000)
+                Memory32Fixed (ReadWrite, 0x702E2000, 0x00001000)
+                I2cSerialBusV2 (0x001C, ControllerInitiated, 100000, AddressingMode7Bit, "\\_SB.I2C1", 0x00, ResourceConsumer, , Exclusive, )
+            })
+
+            Method (_STA, 0, NotSerialized)
+            {
+                Return (0x0F)
+            }
+        }
+
+        // R405: Wi-Fi for switchwifi.sys (ACPI\SWOA0D01). BCM4356 on Tegra210
+        // PCIe port 1. pci.sys cannot enumerate this controller (no ECAM), so
+        // UEFI brings the link up, assigns the BARs and enables memory space;
+        // the driver gets the BARs, the bus 1 config window, root port 1 and
+        // the AFI directly. Order matters (the driver takes them by position).
+        Device (WLN0)
+        {
+            Name (_HID, "SWOA0D01")
+            Name (_UID, Zero)
+            Name (_CRS, ResourceTemplate ()
+            {
+                Memory32Fixed (ReadWrite, 0x13400000, 0x00008000)   // BAR0
+                Memory32Fixed (ReadWrite, 0x13000000, 0x00400000)   // BAR2
+                Memory32Fixed (ReadWrite, 0x11FFF000, 0x00001000)   // config, bus 1
+                Memory32Fixed (ReadWrite, 0x01001000, 0x00001000)   // root port 1
+                Memory32Fixed (ReadWrite, 0x01003800, 0x00000800)   // AFI
             })
 
             Method (_STA, 0, NotSerialized)
