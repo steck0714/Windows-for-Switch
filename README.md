@@ -100,7 +100,7 @@ battery, fan, touch, power button, CPU clock, RTC, sensors, Bluetooth, audio and
 update the drivers over the air.
 
 ## Credits
-
+- [hayato41200](https://github.com/hayato41200/Windows-for-Switch): The original author of this repository.
 - [imbushuo](https://github.com/imbushuo): NintendoSwitchPkg and the Switch coreboot.
 - [CTCaer / Hekate](https://github.com/CTCaer/hekate) and Switchroot (L4T): register
   sequences for the fan, touch panel, backlight, PMIC and charger.
